@@ -1,0 +1,158 @@
+%INCLUDE '~/parmfile.inc';
+
+
+LIBNAME SSSI ORACLE USER=&eid_ccrd.
+                PASSWORD=&pwd_ccrd.  
+                PATH=F3RDPROD 
+                SCHEMA='OPS$F3RDPROD';
+
+libname RTLDISTR '/sasdata/nonrep/retail/distribution';
+LIBNAME CONSTEMP '/sasnas/consumerrisk_constemp';
+libname CONSPAY '/sasdata/nonrep/conspay';
+/*Creating table of actual performance data that can be compared with model predictions*/
+/*Update driver_table_input (beginning of code and the name of the results table (last command)*/
+
+%let driver_table_input = conspay.mc_dm_prosp_driver_181026; 
+%let start_perf_mth = 201609;
+%let end_perf_mth = 201810;
+
+%macro monthly_spr_pull(date,driver_table,output_table);
+proc sql;
+drop table _current_perf;
+drop table _current_perf_niat;
+create table _current_perf as
+                       SELECT 
+                       a.acct_key,
+                       mth_key,
+                       Month_On_Book_F,
+					   open_flag,
+					   close_flag,
+					   amt_crlim,
+					   NET_BT_PUR_V3,
+					   NET_BT_PUR_OTH_V3, 
+					   NET_BT_CC_CSH_V3, 
+					   NET_BT_CC_CSH_OTH_V3,
+/*                     for interest revenue and cost of funds*/
+                       amt_curr_bal,
+                       clean_up_flag,
+                       NET_FC_PURCHASE_V3,
+                       NET_FC_CASH_V3,
+/*                     for interchange revenue*/
+                       NET_PURCHASE_V3,
+                       NET_intrchg_amt,
+/*                     fees revenue*/
+                       NET_FEE_TERM_XFER_V3,
+                       NET_FEE_RET_PMT_V3,
+                       NET_FEE_OV_LMT_V3,
+                       NET_FEE_LATE_PMT_V3,
+                       NET_FEE_INACVITY_V3,
+                       NET_FEE_CASH_ADV_V3,
+                       NET_FEE_BT_PUR_V3,
+                       NET_FEE_BT_CASH_V3,
+                       NET_FEE_FAST_CARD_V3,
+                       NET_FEE_CONV_CHK_v3,
+                       NET_FEE_X_BORDER_V3,
+                       NET_FEE_CLSE_ACCT_V3,
+                       NET_FEE_CLIENT_SVC_V3,
+                       NET_FEE_CRD_REPLA_V3,
+                       NET_FEE_BT_V3,
+                       NET_FEE_ANNUAL_V3,
+/*                     losses*/
+                       AMT_COFF, /*probably principal coff, but verify*/
+                       COFF_FLAG,
+					   amt_adb_all, 
+					   amt_adb_cash, 
+					   amt_adb_nri, 
+					   amt_adb_ri,
+					   num_day_pdue
+from 
+(select acct_key from &driver_table) a
+inner join
+(select * from conspay.spr_v10_&date) b
+on a.acct_key = b.acct_key
+;
+quit;
+
+proc append base= &output_table data=_current_perf force;
+run;
+%mend;
+
+%macro get_month(start,end,driver_table,output_table);
+        proc sql; drop table &output_table;
+        create table &output_table(
+									ACCT_KEY  NUM(8),
+									AMT_COFF  NUM(8),
+									AMT_CRLIM  NUM(8),
+									AMT_CURR_BAL  NUM(8),
+									CLEAN_UP_FLAG  NUM(8),
+									CLOSE_FLAG  NUM(8),
+									COFF_FLAG  NUM(8),
+									month_on_book_f  NUM(8),
+									MTH_KEY  NUM(8),
+									NET_FC_CASH_V3  NUM(8),
+									NET_FC_PURCHASE_V3  NUM(8),
+									NET_FEE_ANNUAL_v3  NUM(8),
+									NET_FEE_BT_CASH_v3  NUM(8),
+									NET_FEE_BT_PUR_v3  NUM(8),
+									NET_FEE_BT_v3  NUM(8),
+									NET_FEE_CASH_ADV_v3  NUM(8),
+									NET_FEE_CLIENT_SVC_v3  NUM(8),
+									NET_FEE_CLSE_ACCT_v3  NUM(8),
+									NET_FEE_CONV_CHK_v3  NUM(8),
+									NET_FEE_CRD_REPLA_v3  NUM(8),
+									NET_FEE_FAST_CARD_v3  NUM(8),
+									NET_FEE_INACVITY_v3  NUM(8),
+									NET_FEE_LATE_PMT_v3  NUM(8),
+									NET_FEE_OV_LMT_v3  NUM(8),
+									NET_FEE_RET_PMT_v3  NUM(8),
+									NET_FEE_TERM_XFER_v3  NUM(8),
+									NET_FEE_X_BORDER_v3  NUM(8),
+									NET_intrchg_amt  NUM(8),
+									NET_PURCHASE_V3  NUM(8),
+									NET_BT_PUR_V3 NUM(8),
+								    NET_BT_PUR_OTH_V3 NUM(8), 
+									NET_BT_CC_CSH_V3 NUM(8), 
+									NET_BT_CC_CSH_OTH_V3 NUM(8),
+									OPEN_FLAG  NUM(8),
+									amt_adb_all NUM(8), 
+									amt_adb_cash NUM(8), 
+									amt_adb_nri NUM(8), 
+									amt_adb_ri NUM(8),
+									num_day_pdue NUM(8)
+									);
+        quit;
+        %DO i = &start %TO &end;
+               %if %substr(&i,5,2)=13 %then %let i=%eval(&i+88);
+               %put &i;
+               %monthly_spr_pull(&i,&driver_table,&output_table);
+        %END;
+%mend;
+
+%get_month(&start_perf_mth,&end_perf_mth,&driver_table_input,spr_output);
+
+data work.perf
+set spr_output;
+run;
+
+/*Sort by Acct_Key and MOB*/
+
+proc sort data=work.perf out=work.perf_sorted;
+    by acct_key month_on_book_f;
+run;
+
+/*Add EverDQ60 Flag*/
+data work.perf_dq;
+set work.perf_sorted;
+by acct_key month_on_book_f;
+retain DQ60Ever;
+
+if first.acct_key and first.month_on_book_f then DQ60Ever = 0;
+else if DQ60Ever = 1 then DQ60Ever = 1;
+else if num_day_pdue>=60 then DQ60Ever = 1;
+run;
+
+/* save as new file */
+/*Use this table as input into PV runs */
+data conspay.mc_dm_perf_table;
+set work.perf_dq;
+run;
