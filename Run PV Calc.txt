@@ -1,0 +1,3341 @@
+%INCLUDE '~/parmfile.inc';
+
+
+LIBNAME SSSI ORACLE USER=&eid_ccrd.
+                PASSWORD=&pwd_ccrd.  
+                PATH=F3RDPROD 
+                SCHEMA='OPS$F3RDPROD';
+
+libname RTLDISTR '/sasdata/nonrep/retail/distribution';
+libname CONSPAY '/sasdata/nonrep/conspay';
+
+/********************************************************/
+/*******Script Overview and Instructions*****************/
+/********************************************************/
+/*1 Check that you have a driver table of accounts that satisfies the dependencies listed below.
+If it meets all of the dependencies, then set the dataset equal to the universal driver table variable.*/
+
+/* Dependencies */
+	* Scoring dataset (driver table) must include: fico_scr_orig, channel2, and f_rewards, bau_flag ;
+	* Scoring dataset (driver table) must be distinct by acct_key;
+
+/*Optional Aggregation Variables */
+	* BAU_Flag - Currently we only select accounts where BAU_flag = 1 (both credit_flag and pop_flag = 1);
+	* pop_flag - Excludes thin file, prior bk, scg populations;
+	* credit_flag - Controls for accounts in driver table with outlier credit lines (null or >$25000);
+	* offer_type_0 - specific product offer field beyond just rewards/non-rewards;
+	
+/*2 Next, review the run assumptions. You need to decide if you want to use the actual or predicted credit line for the 
+accounts and make sure you have selected the correct product assumptions. Currently there are 6 choices:
+	-TRIO DM Prospect
+	-TRIO DM Customer
+	-TRIO Take-One (branch originations)
+	-Truly Simple DM Prospect
+	-Truly Simple DM Customer
+	-Truly Simple Take-One(branch originations) */
+
+/*3 Next you will want to review the the stress case variables. The stress case variables have 
+no impact on the base case result. They impact all the accounts the same and are only used in the stress case runs.*/
+
+/*4 The rest of the driver code and cashflow generation code should not need to be touched but can be helpful to review 
+if you want to understand the model.*/
+
+/*5 The last part of the code is any aggregation or manipulation you want to perform on the model results. This part is 
+not standardized and is meant to allow you to produce whatever you would like.*/
+
+/**********Table of Contents**********/
+
+/*1)Run Assumptions and Universal Assumptions*/
+/*2)Stress Case Variables*/
+/*3)Driver and Performance Tables*/
+/*4)Credit Line/Open*/
+/*5A)Charge Off Segments*/
+/*5B)Charge Off Curves*/
+/*6A)PVol Segments*/
+/*6B)PVol Curves*/
+/*7A)RIB and NRIB Segments*/
+/*7B)RIB Curves*/
+/*7C)NRIB Curves*/
+/*8A)Cash Bal Segments*/
+/*8B)Cash Bal Curves*/
+/*9A)BT Fee Segments*/
+/*9B)BT Fee Curves*/
+/*10A)Cash Fee Segments*/
+/*10B)Cash Fee Curves*/
+/*11A)Late Fee Segments*/
+/*11B)Late Fee Curves*/
+/*12A)Attrition Segments*/
+/*12B)Attrition Curves*/
+/*13A)Premium Segments*/
+/*13B)Premium Curves*/
+/*14 Aggregate Drivers*/
+/*15 Apply Factors and Calculate Cash Flows*/
+/*16 Create PV Waterfall*/
+
+/********************************************************/
+/********************Begin Code**************************/
+/********************************************************/
+
+/*1)Run Assumptions and Universal Assumptions*/
+
+%let rewards = 0; /*Enter 1 for Trio or 0 for Truly Simple;*/
+%let teaser_length = 15; /*12 for Trio and 15 for Truly Simple;*/
+%let channel = 'DM Customer'; /*Enter 'DM Prospect', 'DM Customer', "Internet Customer', 'Internet Prospect', 'Take-One';*/
+%let min_fico = 750;
+%let max_fico = 799;
+
+/*Run for only one product*/
+%let select_one_product = 'Y'; 
+%let product_offer = 'TS 15M'; /*Too many permutations*/
+%let include_premium = 0;
+
+
+/* Run w/ Actually Assigned Credit Limit */
+%let select_2018_only = 'Y'; 
+%let use_actual_cl = 'Y'; /*Set to N and use hard-coded credit line for cases when grounding sample is not representative of current line policy*/
+%let credit_line = 7356; 
+
+%let case_type = 'stress case'; /* 'stress case' to include factor adjustments, 'base' otherwise (actual curves will never have adjustments applied);*/
+
+/* Universal Assumptions */
+%let points_earn_per_dollar = .0136; * per $ spend;
+%let CPP = 1; * per point earned;
+%let rewards_breakage = .93;
+%let cash_apr = 0.26;
+%let equity_rate = 0.095;
+%let severity_lt_800 = 0.72; 
+%let severity_gt_800 = 0.40; 
+%let new_account_setup = 5; * per account, one time;
+%let OPS_allocation = 8; * per account, annual;
+%let collections = 3; * per account, annual;
+%let financial_center_cost = 2; * per account, annual;
+%let payrolls = 3; * per account, annual;
+%let occupance_and_IT_allocations = 6; * per account, annual;
+%let EPP_network_fees = 0.0020; * per $ spend;
+%let fraud_expense = 0.0010; * per $ spend;
+%let fc_collectability = 0.97; 
+%let interchange_trio = 0.01859;
+%let interchange_ts = 0.01686;
+
+%let recovery_rate = .11;
+%let cost_of_funds = .02474;
+%let tax_rate = 0;
+%let discount_rate = 0.133;
+%let prime_rate = .0500;
+
+/*2)Stress Case Variables*/
+/*These should be set to 1 unless you are intending to apply factor adjustments*/
+
+/*Stress Case Variables*/
+%let pvol_sc_var = 1.3;
+%let nrib_sc_var = 1;
+%let rib_sc_var = 1.3;
+%let coff_sc_var = 1.3;
+%let close_sc_var = .8;
+%let bt_fee_sc_var = 1;
+%let cash_bal_sc_var =1;
+%let cash_fee_sc_var = 1;
+%let credit_line_sc_var = 1;
+%let late_fee_sc_var = 1;
+
+/* End - Run Assumptions */
+
+/*3)Driver and Performance Tables*/
+%let driver_table = Conspay.MC_DM_CUST_DEC_DRIVER;  *Update this;
+%let spr_results = conspay.mc_dm_cust_dec_perf_dq;  *Update this;
+
+proc sort data=&driver_table out=work.updated_driver_table_0;
+by acct_key;
+run;
+
+
+data updated_driver_table_1;
+set work.updated_driver_table_0;
+by acct_key;
+if first. acct_key then n=1;
+else n+1;
+run;
+
+data updated_driver_table_2;
+set work.updated_driver_table_1;
+select_one_product = &select_one_product;
+select_2018_only = &select_2018_only;
+run;
+
+/*Filter scoring dataset based on flags and ranges set above*/
+proc sql;
+create table updated_driver_table_3 as 
+select
+*
+from updated_driver_table_2
+where n=1
+and FICO_scr_orig between &max_fico and &min_fico
+and BAU_flag = 1
+and (flag_2018 = 1 or select_2018_only = 'N')
+and (offer_type_0 = &product_offer or select_one_product = 'N');
+run;
+
+/*Setting apr base product and fico band*/
+
+data scoring_dataset_0;
+set updated_driver_table_3;
+where f_rewards = &rewards
+and channel2 = &channel;
+if FICO_scr_orig > 850 then apr = &prime_rate+0.1974;
+else if f_rewards = 1 and FICO_scr_orig >= 800 then apr = &prime_rate+0.1074;
+else if f_rewards = 1 and FICO_scr_orig >= 760 then apr = &prime_rate+0.1274;
+else if f_rewards = 1 and FICO_scr_orig >= 710 then apr = &prime_rate+0.1674;
+else if f_rewards = 1 and FICO_scr_orig >= 660 then apr = &prime_rate+0.1974;
+else if f_rewards = 1 then apr = &prime_rate+0.1974;
+else if f_rewards = 0 and FICO_scr_orig >= 820 then apr = &prime_rate+0.0874;
+else if f_rewards = 0 and FICO_scr_orig >= 760 then apr = &prime_rate+0.1074;
+else if f_rewards = 0 and FICO_scr_orig >= 710 then apr = &prime_rate+0.1474;
+else if f_rewards = 0 and FICO_scr_orig >= 660 then apr = &prime_rate+0.1974;
+else if f_rewards = 0 then apr = &prime_rate+0.1974;
+else apr = &prime_rate+0.1974;
+run;
+
+proc sql; 
+create table avg_line
+as
+select
+avg(amt_orig_crlim)as avg_orig_crlim
+from
+scoring_dataset_0;
+run;
+
+proc sql; 
+create table scoring_dataset_1
+as
+select
+*
+from 
+scoring_dataset_0, avg_line ;
+run;
+
+data scoring_dataset;
+set scoring_dataset_1;
+drop amt_orig_crlim;
+rename avg_orig_crlim = amt_orig_crlim;
+run;
+
+/*************** Create Account Level Per Open Metric Tables ******************/
+
+/*4)Credit Line/Open*/
+/*This either selects actual credit limit from our driver table or a hard-coded value based on selections at the beginning of this code*/
+
+data cl_segments_and_multipliers;
+set scoring_dataset (keep=acct_key fico_scr_orig amt_orig_crlim);  
+segment_credit_line = 1;
+multiplier = 1;
+run;
+
+data cl_base_curves;
+format mob comma12. base_credit_line_1 comma12.2;
+
+do mob = 0 to 60;
+		  base_credit_line_1 = &credit_line;
+          output;
+end;
+run;
+
+proc sql;
+create table cl_final_0 as
+(select
+a.acct_key,
+a.amt_orig_crlim,
+a.segment_credit_line,
+a.multiplier,
+b.mob,
+b.base_credit_line_1
+from
+(select * from cl_segments_and_multipliers) a,
+(select * from cl_base_curves) b
+)
+;
+quit;
+ 
+proc sort data=cl_final_0;
+by acct_key;
+run;
+ 
+data cl_final (keep= acct_key segment_credit_line mob credit_line);
+set cl_final_0;
+if &use_actual_cl = 'N' then credit_line = base_credit_line_1*multiplier;
+else credit_line = amt_orig_crlim;
+run;
+
+/* End - Credit Line/Open */
+
+/*5A)Charge Off Segments*/
+
+data coff_segments_and_multipliers;
+set scoring_dataset (keep=acct_key fico_scr_orig);  
+f_rewards = &rewards;
+channel2 = &channel;
+multiplier = 1;
+
+if (channel2 = 'DM Prospect' or channel2 = 'Internet Prospect') and f_rewards = 0 and FICO_SCR_ORIG < 680 then do;
+		segment_coff = 1;
+		if FICO_SCR_ORIG < 660 then multiplier = 1.25; *there is very little actual data available for this assumption -- estimate becomes weak under 660 fico;
+		else multiplier = 1;
+		end;
+else if (channel2 = 'DM Prospect' or channel2 = 'Internet Prospect')and f_rewards = 0 and FICO_SCR_ORIG < 700 then segment_coff = 2;
+else if (channel2 = 'DM Prospect' or channel2 = 'Internet Prospect')and f_rewards = 0 and FICO_SCR_ORIG < 750 then segment_coff = 3;
+else if (channel2 = 'DM Prospect' or channel2 = 'Internet Prospect') and f_rewards = 0 and FICO_SCR_ORIG >= 750 then do;
+		segment_coff = 4;	
+		if FICO_SCR_ORIG < 800 then multiplier = 1;
+		else multiplier = .75; *there is very little actual data available for this assumption -- estimate becomes weak under 660 fico;
+		end;
+else if (channel2 = 'DM Prospect' or channel2 = 'Internet Prospect') and f_rewards = 1 and FICO_SCR_ORIG < 750 then do;
+		segment_coff = 5;	
+		if FICO_SCR_ORIG < 660 then multiplier = 4.00; 
+		else if FICO_SCR_ORIG < 680 then multiplier = 3.00; 
+		else if FICO_SCR_ORIG < 700 then multiplier = 2.25; 
+		else if FICO_SCR_ORIG < 720 then multiplier = 1.75; 
+		else multiplier = 1.25;
+		end;
+else if (channel2 = 'DM Prospect' or channel2 = 'Internet Prospect') and f_rewards = 1 and FICO_SCR_ORIG < 800 then do;
+		segment_coff = 6;
+		multiplier = 1.25;
+		end;
+else if (channel2 = 'DM Prospect' or channel2 = 'Internet Prospect') and f_rewards = 1 and FICO_SCR_ORIG >= 800 then do; 
+		segment_coff = 7;
+		multiplier = 1.50;
+		end;
+else if (channel2 = 'DM Customer' or channel2 = 'Internet Customer') and f_rewards = 0 and FICO_SCR_ORIG < 750 then do;
+		segment_coff = 8;
+		if FICO_SCR_ORIG < 660 then multiplier = 1;
+		else if FICO_SCR_ORIG < 680 then multiplier = 1.30;
+		else if FICO_SCR_ORIG < 700 then multiplier = 1.50;
+		else if FICO_SCR_ORIG < 720 then multiplier = 1.13;
+		else multiplier = 1;
+		end;
+else if (channel2 = 'DM Customer' or channel2 = 'Internet Customer') and f_rewards = 0 and FICO_SCR_ORIG >= 750 then do;
+		segment_coff = 9;
+		if FICO_SCR_ORIG < 800 then multiplier = 2.70;
+		else if FICO_SCR_ORIG <= 850 then multiplier = 1.74;
+		end;
+else if (channel2 = 'DM Customer' or channel2 = 'Internet Customer') and f_rewards = 1 and FICO_SCR_ORIG < 750 then do;
+		segment_coff = 8;	
+		if FICO_SCR_ORIG < 660 then multiplier = 1;*there is very little actual data available for this assumption -- estimate becomes weak under 660 fico;
+		else if FICO_SCR_ORIG < 680 then multiplier = 2.36;*there is very little actual data available for this assumption -- estimate becomes weak under 660 fico;
+		else if FICO_SCR_ORIG < 700 then multiplier = 1.77;*there is very little actual data available for this assumption -- estimate becomes weak under 660 fico;
+		else if FICO_SCR_ORIG < 720 then multiplier = 1.33;*there is very little actual data available for this assumption -- estimate becomes weak under 660 fico;
+		else multiplier = 1;*there is very little actual data available for this assumption -- estimate becomes weak under 660 fico;
+		end;
+else if (channel2 = 'DM Customer' or channel2 = 'Internet Customer') and f_rewards = 1 and FICO_SCR_ORIG >= 750 then do;
+		segment_coff = 9;
+		if FICO_SCR_ORIG < 800 then multiplier = 1;
+		else multiplier = 0.56;
+		end;
+else if (channel2 = 'Take-One' or channel2 = 'Pre-Screen') and f_rewards = 1 then do;
+		segment_coff = 10;
+		if FICO_SCR_ORIG < 750 then multiplier = 1.76;
+		else multiplier = .54;
+		end;
+else if (channel2 = 'Take-One' or channel2 = 'Pre-Screen') and f_rewards = 0 then do;
+		segment_coff = 11;
+		if FICO_SCR_ORIG < 750 then multiplier = 1.0;
+		else multiplier = 1.0;
+		end;
+
+else segment_coff = .;
+
+run;
+
+/*5B)Charge Off Curves*/
+
+data coff_base_curves;
+format mob comma12. base_coff_1-base_coff_9 comma12.6;
+
+do mob = 0 to 60;
+		  
+          /* SEGMENT 1: DM Prospect Non Rewards FICO < 680 */
+		  y = 4; /* month of first non-zero coff */
+		  z = 10; /* month of beginning of plateau */
+		  x = 11; /* duration of plateau */ 
+		  a = 0.007; /* plateau value */
+		  k = -0.018; /* exponential decay rate */
+		  t = z + x - 1; /* first month of exponential decay */
+		  
+		  if mob < y then base_coff_1 = 0;
+		  else if mob < z then base_coff_1 = ( a * mob - a * y )/(z - y);
+		  else if mob < (z + x) then base_coff_1 = a;
+		  else base_coff_1 = a * exp(k * ( mob - t ));
+
+          /* SEGMENT 2: DM Prospect Non Rewards FICO 680 - 700 */
+		  y = 4; /* month of first non-zero coff */
+		  z = 10; /* month of beginning of plateau */
+		  x = 11; /* duration of plateau */ 
+		  a = 0.00525; /* plateau value */
+		  k = -0.018; /* exponential decay rate */
+		  t = z + x - 1; /* first month of exponential decay */
+		  
+		  if mob < y then base_coff_2 = 0;
+		  else if mob < z then base_coff_2 = ( a * mob - a * y )/(z - y);
+		  else if mob < (z + x) then base_coff_2 = a;
+		  else base_coff_2 = a * exp(k * ( mob - t ));
+
+          /* SEGMENT 3: DM Prospect Non Rewards FICO 700 - 749 */
+		  y = 4; /* month of first non-zero coff */
+		  z = 10; /* month of beginning of plateau */
+		  x = 11; /* duration of plateau */ 
+		  a = 0.0035; /* plateau value */
+		  k = -0.018; /* exponential decay rate */
+		  t = z + x - 1; /* first month of exponential decay */
+		  
+		  if mob < y then base_coff_3 = 0;
+		  else if mob < z then base_coff_3 = ( a * mob - a * y )/(z - y);
+		  else if mob < (z + x) then base_coff_3 = a;
+		  else base_coff_3 = a * exp(k * ( mob - t ));
+
+          /* SEGMENT 4: DM Prospect Non Rewards FICO >= 750 */
+		  y = 4; /* month of first non-zero coff */
+		  z = 10; /* month of beginning of plateau */
+		  x = 11; /* duration of plateau */ 
+		  a = 0.0025; /* plateau value */
+		  k = -0.018; /* exponential decay rate */
+		  t = z + x - 1; /* first month of exponential decay */
+		  
+		  if mob < y then base_coff_4 = 0;
+		  else if mob < z then base_coff_4= ( a * mob - a * y )/(z - y);
+		  else if mob < (z + x) then base_coff_4 = a;
+		  else base_coff_4 = a * exp(k * ( mob - t ));
+		  
+		  /* SEGMENT 5: DM Prospect Rewards FICO < 750 */
+		  y = 3; /* month of first non-zero coff */
+		  z = 17; /* month of beginning of plateau */
+		  x = 12; /* duration of plateau */ 
+		  a = 0.002; /* plateau value */
+		  k = -0.015; /* exponential decay rate */
+		  t = z + x - 1; /* first month of exponential decay */
+		  
+		  if mob < y then base_coff_5 = 0;
+		  else if mob < z then base_coff_5 = ( a * mob - a * y )/(z - y);
+		  else if mob < (z + x) then base_coff_5 = a;
+		  else base_coff_5 = a * exp(k * ( mob - t ));
+		  
+		  /* SEGMENT 6: DM Prospect  Rewards FICO 750 - 799 */
+		  y = 3; /* month of first non-zero coff */
+		  z = 10; /* month of beginning of plateau */
+		  x = 6; /* duration of plateau */ 
+		  a = 0.000325; /* plateau value */
+		  k = 0.000; /* exponential decay rate */
+		  t = z + x - 1; /* first month of exponential decay */
+		  
+		  if mob < y then base_coff_6 = 0;
+		  else if mob < z then base_coff_6 = ( a * mob - a * y )/(z - y);
+		  else if mob < (z + x) then base_coff_6 = a;
+		  else base_coff_6 = a * exp(k * ( mob - t ));
+		  
+		  /* SEGMENT 7: DM Prospect  Rewards FICO >= 800 */
+		  y = 3; /* month of first non-zero coff */
+		  z = 10; /* month of beginning of plateau */
+		  x = 6; /* duration of plateau */ 
+		  a = 0.00015; /* plateau value */
+		  k = 0.000; /* exponential decay rate */
+		  t = z + x - 1; /* first month of exponential decay */
+		  
+		  if mob < y then base_coff_7 = 0;
+		  else if mob < z then base_coff_7 = ( a * mob - a * y )/(z - y);
+		  else if mob < (z + x) then base_coff_7 = a;
+		  else base_coff_7 = a * exp(k * ( mob - t ));
+		  
+		  /* SEGMENT 8: DM Customer FICO 620 - 600 */
+		  y = 4; /* month of first non-zero coff */
+		  z = 13; /* month of beginning of plateau */
+		  x = 12; /* duration of plateau */ 
+		  a = 0.0023; /* plateau value */
+		  k = -0.018; /* exponential decay rate */
+		  t = z + x - 1; /* first month of exponential decay */
+		  
+		  if mob < y then base_coff_8 = 0;
+		  else if mob < z then base_coff_8 = ( a * mob - a * y )/(z - y);
+		  else if mob < (z + x) then base_coff_8 = a;
+		  else base_coff_8 = a * exp(k * ( mob - t ));	  
+		  
+		  
+		  /* SEGMENT 9: DM Customer FICO >= 750 */
+		  y = 3; /* month of first non-zero coff */
+		  z = 18; /* month of beginning of plateau */
+		  x = 6; /* duration of plateau */ 
+		  a = 0.00045; /* plateau value */
+		  k = 0.000; /* exponential decay rate */
+		  t = z + x - 1; /* first month of exponential decay */
+		  
+		  if mob < y then base_coff_9 = 0;
+		  else if mob < z then base_coff_9 = ( a * mob - a * y )/(z - y);
+		  else if mob < (z + x) then base_coff_9 = a;
+		  else base_coff_9 = a * exp(k * ( mob - t )); 
+		  
+		  
+		  /* SEGMENT 10: Take-One and Pre-Screen Rewards */
+		  y = 3; /* month of first non-zero coff */
+		  z = 18; /* month of beginning of plateau */
+		  x = 6; /* duration of plateau */ 
+		  a = 0.0010; /* plateau value */
+		  k = 0.000; /* exponential decay rate */
+		  t = z + x - 1; /* first month of exponential decay */
+		  
+		  if mob < y then base_coff_10 = 0;
+		  else if mob < z then base_coff_10 = ( a * mob - a * y )/(z - y);
+		  else if mob < (z + x) then base_coff_10 = a;
+		  else base_coff_10 = a * exp(k * ( mob - t ));
+		  
+		  
+		  /* SEGMENT 11: Take-One and Pre-Screen Non-Rewards */
+		  y = 3; /* month of first non-zero coff */
+		  z = 18; /* month of beginning of plateau */
+		  x = 6; /* duration of plateau */ 
+		  a = 0.0010; /* plateau value */
+		  k = 0.000; /* exponential decay rate */
+		  t = z + x - 1; /* first month of exponential decay */
+		  
+		  if mob < y then base_coff_11 = 0;
+		  else if mob < z then base_coff_11 = ( a * mob - a * y )/(z - y);
+		  else if mob < (z + x) then base_coff_11 = a;
+		  else base_coff_11 = a * exp(k * ( mob - t ));
+
+		  
+		  /* TODO: complete assumptions for base curve for other segments */
+		  /* NOTE: other segments were exclude to expedite usability for Q1 2018 DM decision */
+
+          drop y z x a k t ;
+          output;
+
+end;
+run;
+
+proc sql;
+create table coff_final_0 as
+(select
+a.acct_key,
+a.segment_coff,
+a.multiplier,
+b.mob,
+b.base_coff_1,
+b.base_coff_2,
+b.base_coff_3,
+b.base_coff_4,
+b.base_coff_5,
+b.base_coff_6,
+b.base_coff_7,
+b.base_coff_8,
+b.base_coff_9,
+b.base_coff_10,
+b.base_coff_11
+from
+(select * from coff_segments_and_multipliers) a,
+(select * from coff_base_curves) b)
+;
+quit;
+ 
+proc sort data=coff_final_0;
+by acct_key;
+run;
+ 
+data coff_final (keep= acct_key segment_coff mob coff multiplier);
+set coff_final_0;
+if segment_coff = 1 then coff = base_coff_1 *multiplier;
+else if segment_coff = 2 then coff = base_coff_2 *multiplier;
+else if segment_coff = 3 then coff = base_coff_3 *multiplier;
+else if segment_coff = 4 then coff = base_coff_4 *multiplier;
+else if segment_coff = 5 then coff = base_coff_5 *multiplier;
+else if segment_coff = 6 then coff = base_coff_6 *multiplier;
+else if segment_coff = 7 then coff = base_coff_7 *multiplier;
+else if segment_coff = 8 then coff = base_coff_8 *multiplier;
+else if segment_coff = 9 then coff = base_coff_9 *multiplier;
+else if segment_coff = 10 then coff = base_coff_10 *multiplier;
+else if segment_coff = 11 then coff = base_coff_11 *multiplier;
+run;
+
+/* End - Charge Off/Open */
+
+/*6A)PVol Segments*/
+
+data pvol_segments_and_multipliers;
+set scoring_dataset (keep=acct_key fico_scr_orig amt_orig_crlim);
+if &use_actual_cl = 'N' then AMT_ORIG_CRLIM = &credit_line;  
+f_rewards = &rewards;
+channel2 = &channel;
+multiplier = 1;
+
+if channel2 = 'DM Prospect' and f_rewards = 1 then do;
+	segment_pvol = 1;
+	if FICO_SCR_ORIG < 720 then multiplier = .9;
+	else multiplier = 1;
+	end;
+else if channel2 = 'DM Customer' and f_rewards = 1 then do;
+	segment_pvol = 2;
+	if FICO_SCR_ORIG < 720 then multiplier = .85;
+	else multiplier = 1.1;
+	end;
+else if channel2 = 'DM Prospect' and f_rewards = 0 then do;
+	segment_pvol = 3;
+	if FICO_SCR_ORIG < 720 then multiplier = .8;
+	else multiplier = 1;
+	end;
+else if channel2 = 'DM Customer' and f_rewards = 0 then do;
+	segment_pvol = 4;
+	if FICO_SCR_ORIG < 720 then multiplier = .8;
+	else multiplier = 1;
+	end;
+else if (channel2 = 'Internet Customer' or channel2 = 'Internet Prospect') and f_rewards = 1 then segment_pvol = 5;
+	/* TODO -- develop and write internet assumptions */
+else if (channel2 = 'Take-One' or channel2 = 'Pre-Screen') and f_rewards = 1 and FICO_SCR_ORIG < 750 then do;
+	segment_pvol = 6;
+	IF FICO_SCR_ORIG < 660 THEN multiplier = 0.5;
+	ELSE IF FICO_SCR_ORIG < 700 THEN multiplier = 0.8;
+	ELSE multiplier = 1;
+	end;
+else if (channel2 = 'Take-One' or channel2 = 'Pre-Screen') and f_rewards = 1 and FICO_SCR_ORIG >= 750 then do;
+	segment_pvol = 7;
+	IF FICO_sCR_ORIG < 800 THEN multiplier = 1;
+	ELSE multiplier = 0.93;
+	end;
+else if (channel2 = 'Take-One' or channel2 = 'Pre-Screen') and f_rewards = 0 and FICO_SCR_ORIG >= 750 then do;
+	segment_pvol = 8;
+	IF FICO_sCR_ORIG < 800 THEN multiplier = 1.0;
+	ELSE multiplier = 1.0;
+	end;
+else if f_rewards = 0 then segment_pvol = 9;
+else segment_pvol = .;
+
+run;
+
+
+/*6B)PVol Curves*/
+
+data pvol_base_curves;
+format mob comma12. base_pvol_1-base_pvol_7 comma12.2;
+
+do mob = 0 to 60;
+
+          /* Segment 1: DM Prospect & Rewards */
+          a = 525.0; /* initial peak */
+          b = 100.00; /* ambient level */
+          k = -0.2; /* exponential decay rate */
+		  x = 1; /* first month of plateau */
+          exponential_month = mob - 1;
+          if mob = 0 then base_pvol_1 = 0;
+          else if mob = x then base_pvol_1 = a;
+          else if mob < 11 then base_pvol_1 = a * exp(k * exponential_month);
+          else if mob >= 11 then base_pvol_1 = b;
+
+          /* Segment 2: DM Customer & Rewards 2015 Curves */
+/*          a = 550.0; * initial peak;*/
+/*          b = 130.00; *ambient level;*/
+/*          k = -0.20; *exponential decay rate;*/
+/*          exponential_month = mob - 3;*/
+/*          if mob = 0 then base_pvol_2 = 0;*/
+/*          else if mob = 1 then base_pvol_2 = a / 2;*/
+/*          else if mob < 3 then base_pvol_2 = a;*/
+/*          else if mob < 10 then base_pvol_2 = a * exp(k * exponential_month);*/
+/*          else if mob >= 10 then base_pvol_2 = b;*/
+
+		  /* Segment 2: DM Customer & Rewards 2016 Curves */
+          a = 700.0; * initial peak;
+          b = 475.00; *ambient level;
+          k = -0.03; *exponential decay rate;
+          exponential_month = mob - 1;
+          if mob = 0 then base_pvol_2 = 0;
+          else if mob = 1 then base_pvol_2 = a;
+          else if mob < 16 then base_pvol_2 = a * exp(k * exponential_month);
+          else if mob >= 16 then base_pvol_2 = b;
+
+          /* Segment 3: DM Prospect & Non-Rewards */
+          a = 550.0; * initial peak;
+          b = 110.00; * ambient level;
+          k = -0.2; * exponential decay rate;
+          exponential_month = mob - 1;
+          if mob = 0 then base_pvol_3 = 0;
+          else if mob = 1 then base_pvol_3 = a;
+          else if mob < 11 then base_pvol_3 = a * exp(k * exponential_month);
+          else if mob >= 11 then base_pvol_3 = b;
+
+          /* Segment 4: DM Customer & Non-Rewards */
+          a = 550.0; * initial peak;
+          b = 110.00; * ambient level;
+          k = -0.145; * exponential decay rate;
+          exponential_month = mob - 1;
+          if mob = 0 then base_pvol_4 = 0;
+          else if mob = 1 then base_pvol_4 = a;
+          else if mob < 10 then base_pvol_4 = a * exp(k * exponential_month);
+          else if mob >= 10 then base_pvol_4 = b;
+
+          /* Segment 5: Internet (both Prospect and Customer) & Rewards */
+          a = 614.38; /* initial peak */
+          b = 330; /* ambient level */
+          k = -0.045; /* exponential decay rate */
+          exponential_month = mob - 4;
+          if mob = 0 then base_pvol_5 = 0;
+          else if mob = 1 then base_pvol_5 = a / 2;
+          else if mob <= 4 then base_pvol_5 = a;
+          else if mob < 19 then base_pvol_5 = a * exp(k * exponential_month);
+          else if mob >= 19 then base_pvol_5 = b;
+
+          /* Segment 6: Take One and Prescreen & Rewards FICO < 750*/
+          a = 630.00; /* initial peak */
+          b = 410.00; /* ambient level */
+          k = -0.05; /* exponential decay rate */
+		  m = -1; /* linear decay rate of final line segment */
+		  i = b - m*10; /* y-intercept of final line segment*/
+          exponential_month = mob - 2;
+          if mob = 0 then base_pvol_6 = 0;
+          else if mob <= 2 then base_pvol_6 = a;
+          else if mob < 10 then base_pvol_6 = a * exp(k * exponential_month);
+          else if mob >= 1 then base_pvol_6 = m*mob + i;
+
+          /* Segment 7: Take One and Prescreen & Rewards FICO >= 750*/
+          a = 630.00; /* initial peak */
+          b = 510.00; /* ambient level */
+          k = -0.03; /* exponential decay rate */
+		  m = -1; /* linear decay rate of final line segment */
+		  i = b - m*10; /* y-intercept of final line segment*/
+          exponential_month = mob - 2;
+          if mob = 0 then base_pvol_7 = 0;
+          else if mob <= 2 then base_pvol_7 = a;
+          else if mob < 10 then base_pvol_7 = a * exp(k * exponential_month);
+          else if mob >= 1 then base_pvol_7 = m*mob + i;
+
+          /* Segment 8: Take-One Non Rewards */				
+          a = 475.00; * initial peak;
+          b = 100.00; *ambient level;
+          k = -0.145; * exponential decay rate;
+          exponential_month = mob - 2;
+          if mob = 0 then base_pvol_8 = 0;
+          else if mob = 1 then base_pvol_8 = a / 2;
+          else if mob < 3 then base_pvol_8 = a;
+          else if mob < 14 then base_pvol_8 = a * exp(k * exponential_month);
+          else if mob >= 14 then base_pvol_8 = b;
+
+          /* Segment 9: All channels & Non Rewards */				
+          a = 475.00; * initial peak;
+          b = 100.00; *ambient level;
+          k = -0.145; * exponential decay rate;
+          exponential_month = mob - 2;
+          if mob = 0 then base_pvol_9 = 0;
+          else if mob = 1 then base_pvol_9 = a / 2;
+          else if mob < 3 then base_pvol_9 = a;
+          else if mob < 14 then base_pvol_9 = a * exp(k * exponential_month);
+          else if mob >= 14 then base_pvol_9 = b;
+
+          drop a b k x m i exponential_month;
+          output;
+
+end;
+
+run;
+
+proc sql;
+create table pvol_final_0 as
+(select
+a.acct_key,
+a.segment_pvol,
+a.multiplier,
+b.mob,
+b.base_pvol_1,
+b.base_pvol_2,
+b.base_pvol_3,
+b.base_pvol_4,
+b.base_pvol_5,
+b.base_pvol_6,
+b.base_pvol_7,
+b.base_pvol_8,
+b.base_pvol_9
+from
+(select * from pvol_segments_and_multipliers) a,
+(select * from pvol_base_curves) b)
+;
+quit;
+ 
+proc sort data=pvol_final_0;
+by acct_key;
+run;
+ 
+data pvol_final (keep= acct_key segment_pvol mob pvol);
+set pvol_final_0;
+if segment_pvol = 1 then pvol = base_pvol_1*multiplier;
+if segment_pvol = 2 then pvol = base_pvol_2*multiplier;
+if segment_pvol = 3 then pvol = base_pvol_3*multiplier;
+if segment_pvol = 4 then pvol = base_pvol_4*multiplier;
+if segment_pvol = 5 then pvol = base_pvol_5*multiplier;
+if segment_pvol = 6 then pvol = base_pvol_6*multiplier;
+if segment_pvol = 7 then pvol = base_pvol_7*multiplier;
+if segment_pvol = 8 then pvol = base_pvol_8*multiplier;
+if segment_pvol = 9 then pvol = base_pvol_9*multiplier;
+run;
+
+/* End - Purchase Volume/Open */
+
+/* Rate and Non-Rate Incented Revolving Balances/Open */
+
+/*7A)RIB and NRIB Segments*/
+
+data rib_and_nrib_seg_and_multipliers;
+set scoring_dataset (keep=acct_key fico_scr_orig);  
+f_rewards = &rewards;
+channel = &channel;
+
+/*########*/
+/* Rewards*/
+/*########*/
+
+/*DM Prospects*/
+if FICO_SCR_ORIG >= 800 and f_rewards = 1 and channel = "DM Prospect" then do;
+        segment_rib = 9;
+               segment_nrib = 17;
+               if FICO_SCR_ORIG <= 850 and FICO_SCR_ORIG >= 800 then multiplier = 0.12;
+end;
+else if FICO_SCR_ORIG >= 750 and FICO_SCR_ORIG < 800 and f_rewards = 1 and channel = "DM Prospect" then do;
+        segment_rib = 13;
+               segment_nrib = 16;
+			   if FICO_SCR_ORIG < 800 and FICO_SCR_ORIG >= 750 then multiplier = 0.30; 
+end;
+else if FICO_SCR_ORIG >= 720 and FICO_SCR_ORIG < 750 and f_rewards = 1 and channel = "DM Prospect" then do;
+        segment_rib = 12;
+               segment_nrib = 20;
+               if FICO_SCR_ORIG < 750 then multiplier = 0.90;
+end;
+
+else if FICO_SCR_ORIG < 680 and f_rewards = 1 and channel = "DM Prospect" then do;
+        segment_rib = 7;
+               segment_nrib = 13;
+               if FICO_SCR_ORIG < 680 then multiplier = 1.65;
+end;
+else if FICO_SCR_ORIG < 700 and FICO_SCR_ORIG >= 680 and f_rewards = 1 and channel = "DM Prospect" then do;
+        segment_rib = 10;
+               segment_nrib = 18;
+			   if FICO_SCR_ORIG < 700 and FICO_SCR_ORIG >= 680 then multiplier = 1.45;
+end;
+else if FICO_SCR_ORIG < 720 and FICO_SCR_ORIG >= 700 and f_rewards = 1 and channel = "DM Prospect" then do;
+        segment_rib = 11;
+               segment_nrib = 19;
+			   if FICO_SCR_ORIG < 720 and FICO_SCR_ORIG >= 700 then multiplier = 1.45;
+end;
+
+
+/*DM Customer*/
+else if FICO_SCR_ORIG >= 800 and f_rewards = 1 and channel = "DM Customer" then do;
+        segment_rib = 7;
+               segment_nrib = 12;
+               if FICO_SCR_ORIG < 800 then multiplier = 0.80; 
+               else if FICO_SCR_ORIG <= 850 and FICO_SCR_ORIG >= 800 then multiplier = 0.25; 
+end;
+
+else if FICO_SCR_ORIG >= 750 and FICO_SCR_ORIG < 800 and f_rewards = 1 and channel = "DM Customer" then do;
+        segment_rib = 1;
+               segment_nrib = 1;
+               if FICO_SCR_ORIG < 800 then multiplier = 0.80; 
+               else if FICO_SCR_ORIG <= 850 and FICO_SCR_ORIG >= 800 then multiplier = 0.25; 
+end;
+
+else if FICO_SCR_ORIG < 680 and f_rewards = 1 and channel = "DM Customer" then do;
+        segment_rib = 8;
+               segment_nrib = 14;
+			   if FICO_SCR_ORIG < 680 then multiplier = 2.00;
+end;
+
+else if FICO_SCR_ORIG >= 680 and FICO_SCR_ORIG < 700 and f_rewards = 1 and channel = "DM Customer" then do;
+        segment_rib = 1;
+               segment_nrib = 2;
+               if FICO_SCR_ORIG < 700 and FICO_SCR_ORIG >= 680 then multiplier = 1.90;
+end;
+
+else if FICO_SCR_ORIG >= 700 and FICO_SCR_ORIG < 720 and f_rewards = 1 and channel = "DM Customer" then do;
+        segment_rib = 9;
+               segment_nrib = 15;
+               if FICO_SCR_ORIG < 720 and FICO_SCR_ORIG >= 700 then multiplier = 2.20; 
+end;
+
+else if FICO_SCR_ORIG >= 720 and FICO_SCR_ORIG < 750 and f_rewards = 1 and channel = "DM Customer" then do;
+        segment_rib = 1;
+               segment_nrib = 2;
+               if FICO_SCR_ORIG < 750 and FICO_SCR_ORIG >= 720 then multiplier = 1.80; 
+end;
+
+/* Take-One*/
+
+else if FICO_SCR_ORIG < 680 and f_rewards = 1 and channel = "Take-One" then do;
+        segment_rib = 8;
+               segment_nrib = 14;
+			   if FICO_SCR_ORIG < 680 and FICO_SCR_ORIG >= 660 then multiplier = 1.31;*1.24;
+			   else if FICO_SCR_ORIG < 660 then multiplier = 1.55;
+end;
+
+else if FICO_SCR_ORIG >= 680 and FICO_SCR_ORIG < 700 and f_rewards = 1 and channel = "Take-One" then do;
+        segment_rib = 1;
+               segment_nrib = 2;
+               if FICO_SCR_ORIG < 700 and FICO_SCR_ORIG >= 680 then multiplier = 1.72;*1.55;
+end;
+
+else if FICO_SCR_ORIG >= 700 and FICO_SCR_ORIG < 720 and f_rewards = 1 and channel = "Take-One" then do;
+        segment_rib = 9;
+               segment_nrib = 15;
+               if FICO_SCR_ORIG < 720 and FICO_SCR_ORIG >= 700 then multiplier = 1.96;*2; 
+end;
+
+else if FICO_SCR_ORIG >= 720 and FICO_SCR_ORIG < 800 and f_rewards = 1 and channel = "Take-One" then do;
+        segment_rib = 1;
+               segment_nrib = 2;
+               if FICO_SCR_ORIG < 750 and FICO_SCR_ORIG >= 720 then multiplier = 1.79;*1.81; 
+               else if FICO_SCR_ORIG < 800 and FICO_SCR_ORIG >= 750 then multiplier = 1.05;*0.95; 
+end;
+
+
+else if FICO_SCR_ORIG >= 800 and f_rewards = 1 and channel = "Take-One" then do;
+        segment_rib = 7;
+               segment_nrib = 12;
+               if FICO_SCR_ORIG <= 850 and FICO_SCR_ORIG >= 800 then multiplier = 0.328; 
+end;
+
+/*Pre Screen*/
+
+else if FICO_SCR_ORIG < 680 and f_rewards = 1 and channel = "Pre-Screen" then do;
+        segment_rib = 8;
+               segment_nrib = 14;
+			   if FICO_SCR_ORIG < 680 and FICO_SCR_ORIG >= 660 then multiplier = 1.47;*1.24;
+			   else if FICO_SCR_ORIG < 660 then multiplier = .91;*1.56;
+end;
+
+else if FICO_SCR_ORIG >= 680 and FICO_SCR_ORIG < 700 and f_rewards = 1 and channel = "Pre-Screen" then do;
+        segment_rib = 1;
+               segment_nrib = 2;
+               if FICO_SCR_ORIG < 700 and FICO_SCR_ORIG >= 680 then multiplier = 1.84;*1.72;*1.55;
+end;
+
+else if FICO_SCR_ORIG >= 700 and FICO_SCR_ORIG < 720 and f_rewards = 1 and channel = "Pre-Screen" then do;
+        segment_rib = 9;
+               segment_nrib = 15;
+               if FICO_SCR_ORIG < 720 and FICO_SCR_ORIG >= 700 then multiplier = 2.96;*1.96;*2; 
+end;
+
+else if FICO_SCR_ORIG >= 720 and FICO_SCR_ORIG < 800 and f_rewards = 1 and channel = "Pre-Screen" then do;
+        segment_rib = 1;
+               segment_nrib = 2;
+			   if FICO_SCR_ORIG < 750 and FICO_SCR_ORIG >= 720 then multiplier = 2.53;*1.79;*1.81; 
+               else if FICO_SCR_ORIG < 800 and FICO_SCR_ORIG >= 750 then multiplier = 1.47;*1.05;*0.95; 
+end;
+
+
+else if FICO_SCR_ORIG >= 800 and f_rewards = 1 and channel = "Pre-Screen" then do;
+        segment_rib = 7;
+               segment_nrib = 12;
+               if FICO_SCR_ORIG <= 850 and FICO_SCR_ORIG >= 800 then multiplier = .497; 
+end;
+
+/* Internet */
+
+else if FICO_SCR_ORIG < 680 and f_rewards = 1 and channel in ("Internet Customer", "Internet Prospect") then do;
+        segment_rib = 8;
+               segment_nrib = 14;
+			   if FICO_SCR_ORIG < 680 and FICO_SCR_ORIG >= 660 then multiplier = 2.0;*1.32;*1.24;
+			   else if FICO_SCR_ORIG < 660 then multiplier = 3.64;*.91;*1.56;
+end;
+
+else if FICO_SCR_ORIG >= 680 and FICO_SCR_ORIG < 700 and f_rewards = 1 and channel in ("Internet Customer", "Internet Prospect") then do;
+        segment_rib = 1;
+               segment_nrib = 2;
+               if FICO_SCR_ORIG < 700 and FICO_SCR_ORIG >= 680 then multiplier = 2.29;*1.69;*1.72;*1.55;
+end;
+
+else if FICO_SCR_ORIG >= 700 and FICO_SCR_ORIG < 720 and f_rewards = 1 and channel in ("Internet Customer", "Internet Prospect") then do;
+        segment_rib = 9;
+               segment_nrib = 15;
+               if FICO_SCR_ORIG < 720 and FICO_SCR_ORIG >= 700 then multiplier = 2.82;*1.96;*2; 
+end;
+
+else if FICO_SCR_ORIG >= 720 and FICO_SCR_ORIG < 800 and f_rewards = 1 and channel in ("Internet Customer", "Internet Prospect") then do;
+        segment_rib = 1;
+               segment_nrib = 2;
+               if FICO_SCR_ORIG < 750 and FICO_SCR_ORIG >= 720 then multiplier = 2.12;*2.41;*1.79;*1.81; 
+               else if FICO_SCR_ORIG < 800 and FICO_SCR_ORIG >= 750 then multiplier = 1.16;*1.34;*1.05;*0.95; 
+end;
+
+
+else if FICO_SCR_ORIG >= 800 and f_rewards = 1 and channel in ("Internet Customer", "Internet Prospect") then do;
+        segment_rib = 7;
+               segment_nrib = 12;
+               if FICO_SCR_ORIG <= 850 and FICO_SCR_ORIG >= 800 then multiplier = 0.83; 
+end;
+
+
+/*############*/
+/* Non-Rewards*/
+/*############*/
+
+/*DM Customer*/
+else if FICO_SCR_ORIG >= 800 and f_rewards = 0 and channel = "DM Customer"  then do;
+        segment_rib = 5;
+               segment_nrib = 6;
+               if FICO_SCR_ORIG >= 800 then multiplier = 0.60;
+end;
+
+else if FICO_SCR_ORIG >= 750 and FICO_SCR_ORIG < 800  and f_rewards = 0 and channel = "DM Customer"  then do;
+        segment_rib = 4;
+               segment_nrib = 5;
+			   if FICO_SCR_ORIG >= 750 and FICO_SCR_ORIG < 800 then multiplier = 1.10;
+end;
+
+else if FICO_SCR_ORIG >= 720 and FICO_SCR_ORIG < 750  and f_rewards = 0 and channel = "DM Customer"  then do;
+        segment_rib = 3;
+               segment_nrib = 30;
+			   if FICO_SCR_ORIG >= 720 and FICO_SCR_ORIG < 750 then multiplier = 1.20;
+end;
+
+else if FICO_SCR_ORIG >= 700 and FICO_SCR_ORIG < 720  and f_rewards = 0 and channel = "DM Customer"  then do;
+        segment_rib = 3;
+               segment_nrib = 29;
+			   if FICO_SCR_ORIG >= 700 and FICO_SCR_ORIG < 720 then multiplier = 1.15;
+end;
+
+else if FICO_SCR_ORIG >= 660 and FICO_SCR_ORIG < 700  and f_rewards = 0 and channel = "DM Customer"  then do;
+        segment_rib = 3;
+               segment_nrib = 28;
+               if FICO_SCR_ORIG >= 660 and FICO_SCR_ORIG < 680 then multiplier = 0.77;
+			   else if FICO_SCR_ORIG >= 680 and FICO_SCR_ORIG < 700 then multiplier = 1.00;
+end;
+
+else if FICO_SCR_ORIG < 660 and f_rewards = 0 and channel = "DM Customer"  then do;
+        segment_rib = 2;
+               segment_nrib = 3;
+               if FICO_SCR_ORIG < 660 then multiplier = 0.65;
+end;
+
+/*DM Prospect*/
+else if FICO_SCR_ORIG >= 750 and f_rewards = 0 and channel = "DM Prospect"  then do;
+        segment_rib = 6;
+               segment_nrib = 9;
+               if FICO_SCR_ORIG < 800 and FICO_SCR_ORIG >= 750 then multiplier = 1.46;
+               else if FICO_SCR_ORIG <= 850 and FICO_SCR_ORIG >= 800 then multiplier = 1.35;
+end;
+
+else if FICO_SCR_ORIG >= 720 and FICO_SCR_ORIG < 750 and f_rewards = 0 and channel = "DM Prospect"  then do;
+        segment_rib = 6;
+               segment_nrib = 10;
+               if FICO_SCR_ORIG < 750 and FICO_SCR_ORIG >= 720 then multiplier = 1.65;
+end;
+
+else if FICO_SCR_ORIG < 680 and f_rewards = 0 and channel = "DM Prospect" then do;
+        segment_rib = 3;
+               segment_nrib = 7;
+               if FICO_SCR_ORIG < 660 and FICO_SCR_ORIG >= 640 then multiplier = 0.50;
+               else if FICO_SCR_ORIG < 680 and FICO_SCR_ORIG >= 660 then multiplier = 0.81;
+end;
+
+else if FICO_SCR_ORIG < 700 and FICO_SCR_ORIG >= 680 and f_rewards = 0 and channel = "DM Prospect" then do;
+        segment_rib = 3;
+               segment_nrib = 27;
+               if FICO_SCR_ORIG < 700 and FICO_SCR_ORIG >= 680 then multiplier = 1.12;
+end;
+
+else if FICO_SCR_ORIG < 720 and FICO_SCR_ORIG >= 700 and f_rewards = 0 and channel = "DM Prospect" then do;
+        segment_rib = 3;
+               segment_nrib = 8;
+               if FICO_SCR_ORIG < 720 and FICO_SCR_ORIG >= 700 then multiplier = 1.21; 
+end;
+
+
+/* Take-One*/
+
+else if FICO_SCR_ORIG < 700 and f_rewards = 0 and channel = "Take-One" then do;
+        segment_rib = 16;
+               segment_nrib = 24;*3;
+			   if FICO_SCR_ORIG < 660 then multiplier = .131; 
+               else if FICO_SCR_ORIG < 680 and FICO_SCR_ORIG >= 660 then multiplier = .211; 
+			   else if FICO_SCR_ORIG < 700 and FICO_SCR_ORIG >= 680 then multiplier = .41;
+end;
+
+else if FICO_SCR_ORIG < 750 and FICO_SCR_ORIG >= 700 and f_rewards = 0 and channel = "Take-One" then do;
+        segment_rib = 6;
+               segment_nrib = 25;*9;
+			   if FICO_SCR_ORIG < 720 and FICO_SCR_ORIG >= 700 then multiplier = .57; 
+               else if FICO_SCR_ORIG < 750 and FICO_SCR_ORIG >= 720 then multiplier = .703;*.81; 
+end;
+
+
+else if FICO_SCR_ORIG < 800 and FICO_SCR_ORIG >= 750 and f_rewards = 0 and channel = "Take-One" then do;
+        segment_rib = 14;
+               segment_nrib = 21;
+               if FICO_SCR_ORIG < 800 and FICO_SCR_ORIG >= 750 then multiplier = 1.06; 
+end;
+
+else if FICO_SCR_ORIG >= 800 and f_rewards = 0 and channel = "Take-One" then do;
+        segment_rib = 15;
+               segment_nrib = 22;
+               if FICO_SCR_ORIG >= 800 then multiplier = .899; 
+end;
+
+
+/* Pre-Screen */
+
+else if FICO_SCR_ORIG < 700 and f_rewards = 0 and channel = "Pre-Screen" then do;
+        segment_rib = 16;
+               segment_nrib = 24;*3;
+			   if FICO_SCR_ORIG < 660 then multiplier = .125; 
+               else if FICO_SCR_ORIG < 680 and FICO_SCR_ORIG >= 660 then multiplier = .07; 
+			   else if FICO_SCR_ORIG < 700 and FICO_SCR_ORIG >= 680 then multiplier = .11;
+end;
+
+else if FICO_SCR_ORIG < 750 and FICO_SCR_ORIG >= 700 and f_rewards = 0 and channel = "Pre-Screen" then do;
+        segment_rib = 3;
+               segment_nrib = 11;*9;
+			   if FICO_SCR_ORIG < 720 and FICO_SCR_ORIG >= 700 then multiplier = .5;
+               else if FICO_SCR_ORIG < 750 and FICO_SCR_ORIG >= 720 then multiplier = .686; 
+end;
+
+
+else if FICO_SCR_ORIG < 800 and FICO_SCR_ORIG >= 750 and f_rewards = 0 and channel = "Pre-Screen" then do;
+        segment_rib = 14;
+               segment_nrib = 26;
+               if FICO_SCR_ORIG < 800 and FICO_SCR_ORIG >= 750 then multiplier = 1.019; 
+end;
+
+else if FICO_SCR_ORIG >= 800 and f_rewards = 0 and channel = "Pre-Screen" then do;
+        segment_rib = 14;
+               segment_nrib = 21;
+               if FICO_SCR_ORIG >= 800 then multiplier = .4675; 
+end;
+
+
+/* Internet */
+
+else if FICO_SCR_ORIG < 700 and f_rewards = 0 and channel in ("Internet Customer", "Internet Prospect") then do;
+        segment_rib = 16;
+               segment_nrib = 24;*3;
+			   if FICO_SCR_ORIG < 660 then multiplier = .22; 
+               else if FICO_SCR_ORIG < 680 and FICO_SCR_ORIG >= 660 then multiplier = .22; 
+			   else if FICO_SCR_ORIG < 700 and FICO_SCR_ORIG >= 680 then multiplier = .57;
+end;
+
+else if FICO_SCR_ORIG < 750 and FICO_SCR_ORIG >= 700 and f_rewards = 0 and channel in ("Internet Customer", "Internet Prospect") then do;
+        segment_rib = 6;
+               segment_nrib = 25;*9;
+			   if FICO_SCR_ORIG < 720 and FICO_SCR_ORIG >= 700 then multiplier = .69; 
+               else if FICO_SCR_ORIG < 750 and FICO_SCR_ORIG >= 720 then multiplier = .79;
+end;
+
+
+else if FICO_SCR_ORIG < 800 and FICO_SCR_ORIG >= 750 and f_rewards = 0 and channel in ("Internet Customer", "Internet Prospect") then do;
+        segment_rib = 14;
+               segment_nrib = 21;
+               if FICO_SCR_ORIG < 800 and FICO_SCR_ORIG >= 750 then multiplier = 1.09;
+end;
+
+else if FICO_SCR_ORIG >= 800 and f_rewards = 0 and channel in ("Internet Customer", "Internet Prospect") then do;
+        segment_rib = 14;
+               segment_nrib = 21;
+               if FICO_SCR_ORIG >= 800 then multiplier = 1.123;*.899; 
+end;
+
+
+
+else do;
+        segment_rib = .;
+        segment_nrib = .;
+end;
+
+run;
+
+
+%let trio_reduction_percent = .25; /* Trio is just BT and a smaller overall % of BT's */
+%let truly_simple_reduction_percent = .45; /* Truly Simple is BT and Purchase Balances*/
+%let long_term_trio_rib_level = 10;
+%let long_term_ts_rib_level = 30;
+
+
+/*7B)RIB Curves*/
+
+data rib_base_curves;
+format mob comma12. base_rib_1-base_rib_16 comma12.2;
+
+do mob = 0 to 60;
+
+/* Trio Curve - Peak at $275 */
+if mob = 0 then base_rib_1 = 0;
+else if mob > 0 and mob < 4 then base_rib_1 = mob * 92;
+else if mob >= 4 and mob < (&teaser_length - 3) then base_rib_1 = 275;
+else if mob = (&teaser_length - 3) then base_rib_1 = 275 - ((&trio_reduction_percent*275) * .05);
+else if mob = (&teaser_length - 2) then base_rib_1 = 275 - ((&trio_reduction_percent*275) * .1);
+else if mob = (&teaser_length - 1) then base_rib_1 = 275 - ((&trio_reduction_percent*275) * .15);
+else if mob = &teaser_length then base_rib_1 = 275 - ((&trio_reduction_percent*275) * .5);
+else base_rib_1 = &long_term_trio_rib_level;
+
+/* Trio Curve - Peak at $200 */
+if mob = 0 then base_rib_7 = 0;
+else if mob > 0 and mob < 4 then base_rib_7 = mob * 67;
+else if mob >= 4 and mob < (&teaser_length - 3) then base_rib_7 = 200;
+else if mob = (&teaser_length - 3) then base_rib_7 = 200 - ((&trio_reduction_percent*200) * .05);
+else if mob = (&teaser_length - 2) then base_rib_7 = 200 - ((&trio_reduction_percent*200) * .1);
+else if mob = (&teaser_length - 1) then base_rib_7 = 200 - ((&trio_reduction_percent*200) * .15);
+else if mob = &teaser_length then base_rib_7 = 200 - ((&trio_reduction_percent*200) * .5);
+else base_rib_7 = &long_term_trio_rib_level;
+
+/* Trio Curve - Peak at $33 */
+if mob = 0 then base_rib_8 = 0;
+else if mob > 0 and mob < 4 then base_rib_8 = mob * 11;
+else if mob >= 4 and mob < (&teaser_length - 3) then base_rib_8 = 33;
+else if mob = (&teaser_length - 3) then base_rib_8 = 33 - ((&trio_reduction_percent*33) * .05);
+else if mob = (&teaser_length - 2) then base_rib_8 = 33 - ((&trio_reduction_percent*33) * .1);
+else if mob = (&teaser_length - 1) then base_rib_8 = 33 - ((&trio_reduction_percent*33) * .15);
+else if mob = &teaser_length then base_rib_8 = 33 - ((&trio_reduction_percent*33) * .5);
+else base_rib_8 = &long_term_trio_rib_level;
+
+/* Trio Curve - Peak at $130 */
+if mob = 0 then base_rib_9 = 0;
+else if mob > 0 and mob < 4 then base_rib_9 = mob * 43;
+else if mob >= 4 and mob < (&teaser_length - 3) then base_rib_9 = 130;
+else if mob = (&teaser_length - 3) then base_rib_9 = 130 - ((&trio_reduction_percent*130) * .05);
+else if mob = (&teaser_length - 2) then base_rib_9 = 130 - ((&trio_reduction_percent*130) * .1);
+else if mob = (&teaser_length - 1) then base_rib_9 = 130 - ((&trio_reduction_percent*130) * .15);
+else if mob = &teaser_length then base_rib_9 = 130 - ((&trio_reduction_percent*130) * .5);
+else base_rib_9 = &long_term_trio_rib_level;
+
+/* Trio Curve - Peak at $500 */
+if mob = 0 then base_rib_10 = 0;
+else if mob > 0 and mob < 4 then base_rib_10 = mob * 167;
+else if mob >= 4 and mob < (&teaser_length - 3) then base_rib_10 = 500;
+else if mob = (&teaser_length - 3) then base_rib_10 = 500 - ((&trio_reduction_percent*500) * .05);
+else if mob = (&teaser_length - 2) then base_rib_10 = 500 - ((&trio_reduction_percent*500) * .1);
+else if mob = (&teaser_length - 1) then base_rib_10 = 500 - ((&trio_reduction_percent*500) * .15);
+else if mob = &teaser_length then base_rib_10 = 500 - ((&trio_reduction_percent*500) * .5);
+else base_rib_10 = &long_term_trio_rib_level;
+
+/* Trio Curve - Peak at $400 */
+if mob = 0 then base_rib_11 = 0;
+else if mob > 0 and mob < 4 then base_rib_11 = mob * 133;
+else if mob >= 4 and mob < (&teaser_length - 3) then base_rib_11 = 400;
+else if mob = (&teaser_length - 3) then base_rib_11 = 400 - ((&trio_reduction_percent*400) * .05);
+else if mob = (&teaser_length - 2) then base_rib_11 = 400 - ((&trio_reduction_percent*400) * .1);
+else if mob = (&teaser_length - 1) then base_rib_11 = 400 - ((&trio_reduction_percent*400) * .15);
+else if mob = &teaser_length then base_rib_11 = 400 - ((&trio_reduction_percent*400) * .5);
+else base_rib_11 = &long_term_trio_rib_level;
+
+/* Trio Curve - Peak at $900 */
+if mob = 0 then base_rib_12 = 0;
+else if mob > 0 and mob < 4 then base_rib_12 = mob * 300;
+else if mob >= 4 and mob < (&teaser_length - 3) then base_rib_12 = 900;
+else if mob = (&teaser_length - 3) then base_rib_12 = 900 - ((&trio_reduction_percent*900) * .05);
+else if mob = (&teaser_length - 2) then base_rib_12 = 900 - ((&trio_reduction_percent*900) * .1);
+else if mob = (&teaser_length - 1) then base_rib_12 = 900 - ((&trio_reduction_percent*900) * .15);
+else if mob = &teaser_length then base_rib_12 = 900 - ((&trio_reduction_percent*900) * .5);
+else base_rib_12 = &long_term_trio_rib_level;
+
+/* Trio Curve - Peak at $750 */
+if mob = 0 then base_rib_13 = 0;
+else if mob > 0 and mob < 4 then base_rib_13 = mob * 250;
+else if mob >= 4 and mob < (&teaser_length - 3) then base_rib_13 = 750;
+else if mob = (&teaser_length - 3) then base_rib_13 = 750 - ((&trio_reduction_percent*750) * .05);
+else if mob = (&teaser_length - 2) then base_rib_13 = 750 - ((&trio_reduction_percent*750) * .1);
+else if mob = (&teaser_length - 1) then base_rib_13 = 750 - ((&trio_reduction_percent*750) * .15);
+else if mob = &teaser_length then base_rib_13 = 750 - ((&trio_reduction_percent*750) * .5);
+else base_rib_13 = &long_term_trio_rib_level;
+
+/* Truly Simple Curve - No drop from peak*/
+if mob = 0 then base_rib_2 = 0;
+else if mob = 1 then base_rib_2 = 500;
+else if mob = 2 then base_rib_2 = 1200;
+else if mob = 3 then base_rib_2 = 1750;
+else if mob = 4 then base_rib_2 = 2050;
+else if mob = 5 then base_rib_2 = 2200;
+else if mob > 5 and mob <= &teaser_length then base_rib_2 = 2200;
+else base_rib_2 = &long_term_ts_rib_level;
+
+/* Truly Simple Curve - 20% drop from peak*/
+if mob = 0 then base_rib_3 = 0;
+else if mob = 1 then base_rib_3 = 500;
+else if mob = 2 then base_rib_3 = 1200;
+else if mob = 3 then base_rib_3 = 1750;
+else if mob = 4 then base_rib_3 = 2050;
+else if mob = 5 then base_rib_3 = 2200;
+else if mob >= 5 and mob <= 10 then base_rib_3 = 2200;
+else if mob > 10 and mob <= &teaser_length then base_rib_3 = 2300 - ((2300*0.25)/(16-mob));
+else base_rib_3 = &long_term_ts_rib_level;
+
+/* Truly Simple Curve - 30% drop from peak*/
+if mob = 0 then base_rib_6 = 0;
+else if mob = 1 then base_rib_6 = 500;
+else if mob = 2 then base_rib_6 = 1200;
+else if mob = 3 then base_rib_6 = 1750;
+else if mob = 4 then base_rib_6 = 2050;
+else if mob = 5 then base_rib_6 = 2200;
+else if mob >= 5 and mob <= 10 then base_rib_6 = 2200;
+else if mob > 10 and mob <= &teaser_length then base_rib_6 = 2300 - ((2300*0.33)/(16-mob));
+else base_rib_6 = &long_term_ts_rib_level;
+
+/* Truly Simple Curve - 40% drop from peak*/
+if mob = 0 then base_rib_4 = 0;
+else if mob = 1 then base_rib_4 = 500;
+else if mob = 2 then base_rib_4 = 1200;
+else if mob = 3 then base_rib_4 = 1750;
+else if mob = 4 then base_rib_4 = 2050;
+else if mob = 5 then base_rib_4 = 2200;
+else if mob >= 5 and mob <= 10 then base_rib_4 = 2200;
+else if mob > 10 and mob <= &teaser_length then base_rib_4 = 2400 - ((2400*0.45)/(16-mob));
+else base_rib_4 = &long_term_ts_rib_level;
+
+/* Truly Simple Curve - 60% drop from peak*/
+if mob = 0 then base_rib_5 = 0;
+else if mob = 1 then base_rib_5 = 500;
+else if mob = 2 then base_rib_5 = 1200;
+else if mob = 3 then base_rib_5 = 1750;
+else if mob = 4 then base_rib_5 = 2050;
+else if mob = 5 then base_rib_5 = 2200;
+else if mob >= 5 and mob <= 10 then base_rib_5 = 2200;
+else if mob > 10 and mob <= &teaser_length then base_rib_5 = 2400 - ((2400*0.63)/(16-mob));
+else base_rib_5 = &long_term_ts_rib_level;
+
+/* Truly Simple Curve - 85% drop from peak - 5 months */
+if mob = 0 then base_rib_14 = 0;
+else if mob = 1 then base_rib_14 = 500;
+else if mob = 2 then base_rib_14 = 1200;
+else if mob = 3 then base_rib_14 = 1750;
+else if mob = 4 then base_rib_14 = 2050;
+else if mob = 5 then base_rib_14 = 2200;
+else if mob >= 5 and mob <= 6 then base_rib_14 = 2200;
+else if mob > 6 and mob <= &teaser_length then base_rib_14 = 2850 - (((2600*0.77)/(21-mob))*5);
+else base_rib_14 = &long_term_ts_rib_level;
+
+/* Truly Simple Curve - 95% drop from peak - 5 months */
+if mob = 0 then base_rib_15 = 0;
+else if mob = 1 then base_rib_15 = 500;
+else if mob = 2 then base_rib_15 = 1200;
+else if mob = 3 then base_rib_15 = 1750;
+else if mob = 4 then base_rib_15 = 2050;
+else if mob = 5 then base_rib_15 = 2200;
+else if mob >= 5 and mob <= 6 then base_rib_15 = 2200;
+else if mob > 6 and mob <= &teaser_length then base_rib_15 = 3150 - (((2700*0.95)/(21-mob))*6);
+else base_rib_15 = &long_term_ts_rib_level;
+
+/* Truly Simple Curve - 10% drop from peak - 5 months */
+if mob = 0 then base_rib_16 = 0;
+else if mob = 1 then base_rib_16 = 500;
+else if mob = 2 then base_rib_16 = 1200;
+else if mob = 3 then base_rib_16 = 1750;
+else if mob = 4 then base_rib_16 = 2050;
+else if mob = 5 then base_rib_16 = 2200;
+else if mob >= 5 and mob <= 6 then base_rib_16 = 2200;
+else if mob > 6 and mob <= &teaser_length then base_rib_16 = 2200 - (((2200*0.25)/(18-mob))*2.5);*2300 - ((2300*0.33)/(17-mob));
+else base_rib_16 = &long_term_ts_rib_level;
+
+output;
+end;
+
+run;
+
+/* Capture Peak and Last Point of Base Rate Incented Balance Curves */
+proc sql;
+
+select 
+ 	max(base_rib_1) into :max_base_rib_1
+from rib_base_curves;
+
+select 
+	max(base_rib_2) into :max_base_rib_2
+from rib_base_curves;
+
+select 
+	max(base_rib_3) into :max_base_rib_3
+from rib_base_curves;
+
+select 
+	max(base_rib_4) into :max_base_rib_4
+from rib_base_curves;
+
+select 
+	max(base_rib_5) into :max_base_rib_5
+from rib_base_curves;
+
+select 
+	max(base_rib_6) into :max_base_rib_6
+from rib_base_curves;
+
+select 
+	max(base_rib_7) into :max_base_rib_7
+from rib_base_curves;
+
+select 
+	max(base_rib_8) into :max_base_rib_8
+from rib_base_curves;
+
+select 
+	max(base_rib_9) into :max_base_rib_9
+from rib_base_curves;
+
+select 
+	max(base_rib_10) into :max_base_rib_10
+from rib_base_curves;
+
+select 
+	max(base_rib_11) into :max_base_rib_11
+from rib_base_curves;
+
+select 
+	max(base_rib_12) into :max_base_rib_12
+from rib_base_curves;
+
+select 
+	max(base_rib_13) into :max_base_rib_13
+from rib_base_curves;
+
+select 
+	max(base_rib_14) into :max_base_rib_14
+from rib_base_curves;
+
+select 
+	max(base_rib_15) into :max_base_rib_15
+from rib_base_curves;
+
+select 
+	max(base_rib_16) into :max_base_rib_16
+from rib_base_curves;
+
+select 
+ 	max(base_rib_1)*&rib_sc_var into :last_base_rib_1
+from rib_base_curves where mob = (&teaser_length);
+
+select 
+	max(base_rib_2)*&rib_sc_var into :last_base_rib_2
+from rib_base_curves where mob = (&teaser_length);
+
+select 
+	max(base_rib_3)*&rib_sc_var into :last_base_rib_3
+from rib_base_curves where mob = (&teaser_length);
+
+select 
+	max(base_rib_4)*&rib_sc_var into :last_base_rib_4
+from rib_base_curves where mob = (&teaser_length);
+
+select 
+	max(base_rib_5)*&rib_sc_var into :last_base_rib_5
+from rib_base_curves where mob = (&teaser_length);
+
+select 
+	max(base_rib_6)*&rib_sc_var into :last_base_rib_6
+from rib_base_curves where mob = (&teaser_length);
+
+select 
+	max(base_rib_7)*&rib_sc_var into :last_base_rib_7
+from rib_base_curves where mob = (&teaser_length);
+
+select 
+	max(base_rib_8)*&rib_sc_var into :last_base_rib_8
+from rib_base_curves where mob = (&teaser_length);
+
+select 
+	max(base_rib_9)*&rib_sc_var into :last_base_rib_9
+from rib_base_curves where mob = (&teaser_length);
+
+select 
+	max(base_rib_10)*&rib_sc_var into :last_base_rib_10
+from rib_base_curves where mob = (&teaser_length);
+
+select 
+	max(base_rib_11)*&rib_sc_var into :last_base_rib_11
+from rib_base_curves where mob = (&teaser_length);
+
+select 
+	max(base_rib_12)*&rib_sc_var into :last_base_rib_12
+from rib_base_curves where mob = (&teaser_length);
+
+select 
+	max(base_rib_13)*&rib_sc_var into :last_base_rib_13
+from rib_base_curves where mob = (&teaser_length);
+
+select 
+	max(base_rib_14)*&rib_sc_var into :last_base_rib_14
+from rib_base_curves where mob = (&teaser_length);
+
+select 
+	max(base_rib_15)*&rib_sc_var into :last_base_rib_15
+from rib_base_curves where mob = (&teaser_length);
+
+select 
+	max(base_rib_16)*&rib_sc_var into :last_base_rib_16
+from rib_base_curves where mob = (&teaser_length);
+
+
+quit;
+
+
+%let base_nrib_1_reduction = &max_base_rib_1 *&rib_sc_var * (1-&trio_reduction_percent);
+%let base_nrib_12_reduction = &max_base_rib_7 *&rib_sc_var * (1-&trio_reduction_percent);
+%let base_nrib_2_reduction = &max_base_rib_1 *&rib_sc_var * (1-&trio_reduction_percent);
+%let base_nrib_13_reduction = &max_base_rib_7 *&rib_sc_var * (1-&trio_reduction_percent);
+%let base_nrib_14_reduction = &max_base_rib_8 *&rib_sc_var * (1-&trio_reduction_percent); 
+%let base_nrib_15_reduction = &max_base_rib_9 *&rib_sc_var * (1-&trio_reduction_percent); 
+%let base_nrib_16_reduction = &max_base_rib_13 *&rib_sc_var * (1-&trio_reduction_percent); 
+%let base_nrib_17_reduction = &max_base_rib_9 *&rib_sc_var * (1-&trio_reduction_percent);
+%let base_nrib_18_reduction = &max_base_rib_10 *&rib_sc_var * (1-&trio_reduction_percent); 
+%let base_nrib_19_reduction = &max_base_rib_11 *&rib_sc_var * (1-&trio_reduction_percent);
+%let base_nrib_20_reduction = &max_base_rib_12 *&rib_sc_var * (1-&trio_reduction_percent);
+
+%let base_nrib_1_mth_reduction = (&base_nrib_1_reduction - &last_base_rib_1)/6;
+%let base_nrib_12_mth_reduction = (&base_nrib_12_reduction - &last_base_rib_7)/6;
+%let base_nrib_2_mth_reduction = (&base_nrib_2_reduction - &last_base_rib_1)/6;
+%let base_nrib_13_mth_reduction = (&base_nrib_13_reduction - &last_base_rib_7)/6;
+%let base_nrib_14_mth_reduction = (&base_nrib_14_reduction - &last_base_rib_8)/6;
+%let base_nrib_15_mth_reduction = (&base_nrib_15_reduction - &last_base_rib_9)/6;
+%let base_nrib_16_mth_reduction = (&base_nrib_16_reduction - &last_base_rib_13)/6;
+%let base_nrib_17_mth_reduction = (&base_nrib_17_reduction - &last_base_rib_9)/6;
+%let base_nrib_18_mth_reduction = (&base_nrib_18_reduction - &last_base_rib_10)/6;
+%let base_nrib_19_mth_reduction = (&base_nrib_19_reduction - &last_base_rib_11)/6;
+%let base_nrib_20_mth_reduction = (&base_nrib_20_reduction - &last_base_rib_12)/6;
+
+
+
+/*7C)NRIB Curves*/
+
+data nrib_base_curves;
+format mob comma12. base_nrib_1-base_nrib_30 comma12.2;
+
+do mob = 0 to 60;
+
+/* Trio Curve - High FICO - $275 Peak */
+if mob = 0 then base_nrib_1 = 0;
+else if mob = 1 then base_nrib_1 = 15;
+else if mob = 2 then base_nrib_1 = 181;
+else if mob = 3 then base_nrib_1 = 310;
+else if mob = 4 then base_nrib_1 = 355;
+else if mob = 5 then base_nrib_1 = 400;
+else if mob >= 6 and mob < &teaser_length + 1 then base_nrib_1 = 430;
+else if mob = &teaser_length + 1 then base_nrib_1 = 430 + &last_base_rib_1/&nrib_sc_var + (&base_nrib_1_mth_reduction * 1);
+else if mob = &teaser_length + 2 then base_nrib_1 = 430 + &last_base_rib_1/&nrib_sc_var + (&base_nrib_1_mth_reduction * 2);
+else if mob = &teaser_length + 3 then base_nrib_1 = 430 + &last_base_rib_1/&nrib_sc_var + (&base_nrib_1_mth_reduction * 3);
+else if mob = &teaser_length + 4 then base_nrib_1 = 430 + &last_base_rib_1/&nrib_sc_var + (&base_nrib_1_mth_reduction * 4);
+else if mob = &teaser_length + 5 then base_nrib_1 = 430 + &last_base_rib_1/&nrib_sc_var + (&base_nrib_1_mth_reduction * 5);
+else base_nrib_1 = 430 + &base_nrib_1_reduction;
+
+/* Trio Curve - High FICO - $200 Peak */
+if mob = 0 then base_nrib_12 = 0;
+else if mob = 1 then base_nrib_12 = 15;
+else if mob = 2 then base_nrib_12 = 181;
+else if mob = 3 then base_nrib_12 = 310;
+else if mob = 4 then base_nrib_12 = 355;
+else if mob = 5 then base_nrib_12 = 400;
+else if mob >= 6 and mob < &teaser_length + 1 then base_nrib_12 = 430;
+else if mob = &teaser_length + 1 then base_nrib_12 = 430 + &last_base_rib_7/&nrib_sc_var + (&base_nrib_12_mth_reduction * 1);
+else if mob = &teaser_length + 2 then base_nrib_12 = 430 + &last_base_rib_7/&nrib_sc_var + (&base_nrib_12_mth_reduction * 2);
+else if mob = &teaser_length + 3 then base_nrib_12 = 430 + &last_base_rib_7/&nrib_sc_var + (&base_nrib_12_mth_reduction * 3);
+else if mob = &teaser_length + 4 then base_nrib_12 = 430 + &last_base_rib_7/&nrib_sc_var + (&base_nrib_12_mth_reduction * 4);
+else if mob = &teaser_length + 5 then base_nrib_12 = 430 + &last_base_rib_7/&nrib_sc_var + (&base_nrib_12_mth_reduction * 5);
+else base_nrib_12 = 430 + &base_nrib_12_reduction;
+
+/* Trio Curve - High FICO - $750 Peak */
+if mob = 0 then base_nrib_16 = 0;
+else if mob = 1 then base_nrib_16 = 15;
+else if mob = 2 then base_nrib_16 = 181;
+else if mob = 3 then base_nrib_16 = 310;
+else if mob = 4 then base_nrib_16 = 355;
+else if mob = 5 then base_nrib_16 = 400;
+else if mob >= 6 and mob < &teaser_length + 1 then base_nrib_16 = 430;
+else if mob = &teaser_length + 1 then base_nrib_16 = 430 + &last_base_rib_13/&nrib_sc_var + (&base_nrib_16_mth_reduction * 1);
+else if mob = &teaser_length + 2 then base_nrib_16 = 430 + &last_base_rib_13/&nrib_sc_var + (&base_nrib_16_mth_reduction * 2);
+else if mob = &teaser_length + 3 then base_nrib_16 = 430 + &last_base_rib_13/&nrib_sc_var + (&base_nrib_16_mth_reduction * 3);
+else if mob = &teaser_length + 4 then base_nrib_16 = 430 + &last_base_rib_13/&nrib_sc_var + (&base_nrib_16_mth_reduction * 4);
+else if mob = &teaser_length + 5 then base_nrib_16 = 430 + &last_base_rib_13/&nrib_sc_var + (&base_nrib_16_mth_reduction * 5);
+else base_nrib_16 = 430 + &base_nrib_16_reduction;
+
+/* Trio Curve - High FICO - $130 Peak */
+if mob = 0 then base_nrib_17 = 0;
+else if mob = 1 then base_nrib_17 = 15;
+else if mob = 2 then base_nrib_17 = 181;
+else if mob = 3 then base_nrib_17 = 310;
+else if mob = 4 then base_nrib_17 = 355;
+else if mob = 5 then base_nrib_17 = 400;
+else if mob >= 6 and mob < &teaser_length + 1 then base_nrib_17 = 430;
+else if mob = &teaser_length + 1 then base_nrib_17 = 430 + &last_base_rib_9/&nrib_sc_var + (&base_nrib_17_mth_reduction * 1);
+else if mob = &teaser_length + 2 then base_nrib_17 = 430 + &last_base_rib_9/&nrib_sc_var + (&base_nrib_17_mth_reduction * 2);
+else if mob = &teaser_length + 3 then base_nrib_17 = 430 + &last_base_rib_9/&nrib_sc_var + (&base_nrib_17_mth_reduction * 3);
+else if mob = &teaser_length + 4 then base_nrib_17 = 430 + &last_base_rib_9/&nrib_sc_var + (&base_nrib_17_mth_reduction * 4);
+else if mob = &teaser_length + 5 then base_nrib_17 = 430 + &last_base_rib_9/&nrib_sc_var + (&base_nrib_17_mth_reduction * 5);
+else base_nrib_17 = 430 + &base_nrib_17_reduction;
+
+/* Trio Curve - Low FICO - $275 Peak*/
+if mob = 0 then base_nrib_2 = 0;
+else if mob = 1 then base_nrib_2 = 15;
+else if mob = 2 then base_nrib_2 = 181;
+else if mob = 3 then base_nrib_2 = 310;
+else if mob = 4 then base_nrib_2 = 355;
+else if mob = 5 then base_nrib_2 = 400;
+else if mob >= 6 and mob < &teaser_length + 1 then base_nrib_2 = 430;
+else if mob = &teaser_length + 1 then base_nrib_2 = 430 + &last_base_rib_1/&nrib_sc_var + (&base_nrib_2_mth_reduction * 1);
+else if mob = &teaser_length + 2 then base_nrib_2 = 430 + &last_base_rib_1/&nrib_sc_var + (&base_nrib_2_mth_reduction * 2);
+else if mob = &teaser_length + 3 then base_nrib_2 = 430 + &last_base_rib_1/&nrib_sc_var + (&base_nrib_2_mth_reduction * 3);
+else if mob = &teaser_length + 4 then base_nrib_2 = 430 + &last_base_rib_1/&nrib_sc_var + (&base_nrib_2_mth_reduction * 4);
+else if mob = &teaser_length + 5 then base_nrib_2 = 430 + &last_base_rib_1/&nrib_sc_var + (&base_nrib_2_mth_reduction * 5);
+else base_nrib_2 = 430 + &base_nrib_2_reduction - ((mob - &teaser_length - 6 ) * (&base_nrib_2_reduction *.01));
+
+/* Trio Curve - Low FICO - $200 Peak*/
+if mob = 0 then base_nrib_13 = 0;
+else if mob = 1 then base_nrib_13 = 15;
+else if mob = 2 then base_nrib_13 = 181;
+else if mob = 3 then base_nrib_13 = 310;
+else if mob = 4 then base_nrib_13 = 355;
+else if mob = 5 then base_nrib_13 = 400;
+else if mob >= 6 and mob < &teaser_length + 1 then base_nrib_13 = 430;
+else if mob = &teaser_length + 1 then base_nrib_13 = 430 + &last_base_rib_7/&nrib_sc_var + (&base_nrib_13_mth_reduction * 1);
+else if mob = &teaser_length + 2 then base_nrib_13 = 430 + &last_base_rib_7/&nrib_sc_var + (&base_nrib_13_mth_reduction * 2);
+else if mob = &teaser_length + 3 then base_nrib_13 = 430 + &last_base_rib_7/&nrib_sc_var + (&base_nrib_13_mth_reduction * 3);
+else if mob = &teaser_length + 4 then base_nrib_13 = 430 + &last_base_rib_7/&nrib_sc_var + (&base_nrib_13_mth_reduction * 4);
+else if mob = &teaser_length + 5 then base_nrib_13 = 430 + &last_base_rib_7/&nrib_sc_var + (&base_nrib_13_mth_reduction * 5);
+else base_nrib_13 = 430 + &base_nrib_13_reduction - ((mob - &teaser_length - 6 ) * (&base_nrib_13_reduction *.01));
+
+/* Trio Curve - Low FICO - $33 Peak*/
+if mob = 0 then base_nrib_14 = 0;
+else if mob = 1 then base_nrib_14 = 15;
+else if mob = 2 then base_nrib_14 = 181;
+else if mob = 3 then base_nrib_14 = 310;
+else if mob = 4 then base_nrib_14 = 355;
+else if mob = 5 then base_nrib_14 = 400;
+else if mob >= 6 and mob < &teaser_length + 1 then base_nrib_14 = 430;
+else if mob = &teaser_length + 1 then base_nrib_14 = 430 + &last_base_rib_8/&nrib_sc_var + (&base_nrib_14_mth_reduction * 1);
+else if mob = &teaser_length + 2 then base_nrib_14 = 430 + &last_base_rib_8/&nrib_sc_var + (&base_nrib_14_mth_reduction * 2);
+else if mob = &teaser_length + 3 then base_nrib_14 = 430 + &last_base_rib_8/&nrib_sc_var + (&base_nrib_14_mth_reduction * 3);
+else if mob = &teaser_length + 4 then base_nrib_14 = 430 + &last_base_rib_8/&nrib_sc_var + (&base_nrib_14_mth_reduction * 4);
+else if mob = &teaser_length + 5 then base_nrib_14 = 430 + &last_base_rib_8/&nrib_sc_var + (&base_nrib_14_mth_reduction * 5);
+else base_nrib_14 = 430 + &base_nrib_14_reduction - ((mob - &teaser_length - 6 ) * (&base_nrib_14_reduction *.01));
+
+/* Trio Curve - Low FICO - $130 Peak*/
+if mob = 0 then base_nrib_15 = 0;
+else if mob = 1 then base_nrib_15 = 15;
+else if mob = 2 then base_nrib_15 = 181;
+else if mob = 3 then base_nrib_15 = 310;
+else if mob = 4 then base_nrib_15 = 355;
+else if mob = 5 then base_nrib_15 = 400;
+else if mob >= 6 and mob < &teaser_length + 1 then base_nrib_15 = 430;
+else if mob = &teaser_length + 1 then base_nrib_15 = 430 + &last_base_rib_9/&nrib_sc_var + (&base_nrib_15_mth_reduction * 1);
+else if mob = &teaser_length + 2 then base_nrib_15 = 430 + &last_base_rib_9/&nrib_sc_var + (&base_nrib_15_mth_reduction * 2);
+else if mob = &teaser_length + 3 then base_nrib_15 = 430 + &last_base_rib_9/&nrib_sc_var + (&base_nrib_15_mth_reduction * 3);
+else if mob = &teaser_length + 4 then base_nrib_15 = 430 + &last_base_rib_9/&nrib_sc_var + (&base_nrib_15_mth_reduction * 4);
+else if mob = &teaser_length + 5 then base_nrib_15 = 430 + &last_base_rib_9/&nrib_sc_var + (&base_nrib_15_mth_reduction * 5);
+else base_nrib_15 = 430 + &base_nrib_15_reduction - ((mob - &teaser_length - 6 ) * (&base_nrib_15_reduction *.01));
+
+/* Trio Curve - Low FICO - $500 Peak*/
+if mob = 0 then base_nrib_18 = 0;
+else if mob = 1 then base_nrib_18 = 15;
+else if mob = 2 then base_nrib_18 = 181;
+else if mob = 3 then base_nrib_18 = 310;
+else if mob = 4 then base_nrib_18 = 355;
+else if mob = 5 then base_nrib_18 = 400;
+else if mob >= 6 and mob < &teaser_length + 1 then base_nrib_18 = 430;
+else if mob = &teaser_length + 1 then base_nrib_18 = 430 + &last_base_rib_10/&nrib_sc_var + (&base_nrib_18_mth_reduction * 1);
+else if mob = &teaser_length + 2 then base_nrib_18 = 430 + &last_base_rib_10/&nrib_sc_var + (&base_nrib_18_mth_reduction * 2);
+else if mob = &teaser_length + 3 then base_nrib_18 = 430 + &last_base_rib_10/&nrib_sc_var + (&base_nrib_18_mth_reduction * 3);
+else if mob = &teaser_length + 4 then base_nrib_18 = 430 + &last_base_rib_10/&nrib_sc_var + (&base_nrib_18_mth_reduction * 4);
+else if mob = &teaser_length + 5 then base_nrib_18 = 430 + &last_base_rib_10/&nrib_sc_var + (&base_nrib_18_mth_reduction * 5);
+else base_nrib_18 = 430 + &base_nrib_18_reduction - ((mob - &teaser_length - 6 ) * (&base_nrib_18_reduction *.01));
+
+/* Trio Curve - Low FICO - $400 Peak*/
+if mob = 0 then base_nrib_19 = 0;
+else if mob = 1 then base_nrib_19 = 15;
+else if mob = 2 then base_nrib_19 = 181;
+else if mob = 3 then base_nrib_19 = 310;
+else if mob = 4 then base_nrib_19 = 355;
+else if mob = 5 then base_nrib_19 = 400;
+else if mob >= 6 and mob < &teaser_length + 1 then base_nrib_19 = 430;
+else if mob = &teaser_length + 1 then base_nrib_19 = 430 + &last_base_rib_11/&nrib_sc_var + (&base_nrib_19_mth_reduction * 1);
+else if mob = &teaser_length + 2 then base_nrib_19 = 430 + &last_base_rib_11/&nrib_sc_var + (&base_nrib_19_mth_reduction * 2);
+else if mob = &teaser_length + 3 then base_nrib_19 = 430 + &last_base_rib_11/&nrib_sc_var + (&base_nrib_19_mth_reduction * 3);
+else if mob = &teaser_length + 4 then base_nrib_19 = 430 + &last_base_rib_11/&nrib_sc_var + (&base_nrib_19_mth_reduction * 4);
+else if mob = &teaser_length + 5 then base_nrib_19 = 430 + &last_base_rib_11/&nrib_sc_var + (&base_nrib_19_mth_reduction * 5);
+else base_nrib_19 = 430 + &base_nrib_19_reduction - ((mob - &teaser_length - 6 ) * (&base_nrib_19_reduction *.01));
+
+/* Trio Curve - Low FICO - $900 Peak*/
+if mob = 0 then base_nrib_20 = 0;
+else if mob = 1 then base_nrib_20 = 15;
+else if mob = 2 then base_nrib_20 = 181;
+else if mob = 3 then base_nrib_20 = 310;
+else if mob = 4 then base_nrib_20 = 355;
+else if mob = 5 then base_nrib_20 = 400;
+else if mob >= 6 and mob < &teaser_length + 1 then base_nrib_20 = 430;
+else if mob = &teaser_length + 1 then base_nrib_20 = 430 + &last_base_rib_12/&nrib_sc_var + (&base_nrib_20_mth_reduction * 1);
+else if mob = &teaser_length + 2 then base_nrib_20 = 430 + &last_base_rib_12/&nrib_sc_var + (&base_nrib_20_mth_reduction * 2);
+else if mob = &teaser_length + 3 then base_nrib_20 = 430 + &last_base_rib_12/&nrib_sc_var + (&base_nrib_20_mth_reduction * 3);
+else if mob = &teaser_length + 4 then base_nrib_20 = 430 + &last_base_rib_12/&nrib_sc_var + (&base_nrib_20_mth_reduction * 4);
+else if mob = &teaser_length + 5 then base_nrib_20 = 430 + &last_base_rib_12/&nrib_sc_var + (&base_nrib_20_mth_reduction * 5);
+else base_nrib_20 = 430 + &base_nrib_20_reduction - ((mob - &teaser_length - 6 ) * (&base_nrib_20_reduction *.01));
+
+
+/*Truly Simple - 10% then 10% Reduction*/
+if mob <= &teaser_length then base_nrib_7 = 0;
+else if mob >= &teaser_length and mob <= &teaser_length + 15 then base_nrib_7 = &last_base_rib_3 - (((&last_base_rib_3*0.10)/15) * (mob - &teaser_length));
+else base_nrib_7 = &last_base_rib_3 - (&last_base_rib_3*0.10);
+
+/*Truly Simple - 10% then 25% Reduction*/
+if mob <= &teaser_length then base_nrib_8 = 0;
+else if mob >= &teaser_length and mob <= &teaser_length + 10 then base_nrib_8 = &last_base_rib_3 - (((&last_base_rib_3*0.30)/10) * (mob - &teaser_length));
+else base_nrib_8 = &last_base_rib_3 - (&last_base_rib_3*0.30);
+
+/*Truly Simple - 50% then 35% Reduction*/
+if mob <= &teaser_length then base_nrib_9 = 0;
+else if mob >= &teaser_length and mob <= &teaser_length + 8 then base_nrib_9 = &last_base_rib_6 - (((&last_base_rib_6*0.25)/8) * (mob - &teaser_length));
+else base_nrib_9 = &last_base_rib_6 - (&last_base_rib_6*0.25);
+
+/*Truly Simple - 50% then 30% Reduction*/
+if mob <= &teaser_length then base_nrib_10 = 0;
+else if mob >= &teaser_length and mob <= &teaser_length + 10 then base_nrib_10 = &last_base_rib_6 - (((&last_base_rib_6*0.30)/10) * (mob - &teaser_length));
+else base_nrib_10 = &last_base_rib_6 - (&last_base_rib_6*0.30);
+
+/*Truly Simple - 10% then 20% Reduction*/
+if mob <= &teaser_length then base_nrib_11 = 0;
+else if mob = &teaser_length + 1 then base_nrib_11 = &last_base_rib_3 - ((&last_base_rib_3*0.20)/3);
+else if mob = &teaser_length + 2 then base_nrib_11 = &last_base_rib_3 - ((&last_base_rib_3*0.20)/2);
+else if mob = &teaser_length + 3 then base_nrib_11 = &last_base_rib_3 - ((&last_base_rib_3*0.20)/1);
+else base_nrib_11 = &last_base_rib_3 - ((&last_base_rib_3*0.20)/1);
+
+/*Truly Simple - 20% then 50% Reduction*/
+if mob <= &teaser_length then base_nrib_6 = 0;
+else if mob = &teaser_length + 1 then base_nrib_6 = &last_base_rib_5 - ((&last_base_rib_5*0.50)/3);
+else if mob = &teaser_length + 2 then base_nrib_6 = &last_base_rib_5 - ((&last_base_rib_5*0.50)/2);
+else if mob = &teaser_length + 3 then base_nrib_6 = &last_base_rib_5 - ((&last_base_rib_5*0.50)/1);
+else base_nrib_6 = &last_base_rib_5 - ((&last_base_rib_5*0.50)/1);
+
+/*Truly Simple - 20% then 20% Reduction*/
+if mob <= &teaser_length then base_nrib_5 = 0;
+else if mob >= &teaser_length and mob <= &teaser_length + 10 then base_nrib_5 = &last_base_rib_4 - (((&last_base_rib_4*0.20)/10) * (mob - &teaser_length));
+else base_nrib_5 = &last_base_rib_4 - (&last_base_rib_4*0.20);
+
+/*Truly Simple - 3 month paydown, then 22 month gradual decline of 40%, then flat */
+if mob <= &teaser_length then base_nrib_4 = 0;
+else if mob = &teaser_length + 1 then base_nrib_4 = &last_base_rib_3 - ((&last_base_rib_3*0.20)/3);
+else if mob = &teaser_length + 2 then base_nrib_4 = &last_base_rib_3 - ((&last_base_rib_3*0.20)/2);
+else if mob = &teaser_length + 3 then base_nrib_4 = &last_base_rib_3 - ((&last_base_rib_3*0.20)/1);
+else if mob > &teaser_length + 3 and mob <= &teaser_length + 25 then base_nrib_4 = &last_base_rib_3 - (&last_base_rib_3*0.20) - (((&last_base_rib_3*0.25)/22) * (mob - &teaser_length - 3)) ;
+else base_nrib_4 = &&last_base_rib_3 - (&last_base_rib_3*0.20) - (&last_base_rib_3*0.25);
+
+/*Truly Simple - 25 month gradual decline of 15%, then flat */
+if mob <= &teaser_length then base_nrib_3 = 0;
+else if mob >= &teaser_length and mob <= &teaser_length + 25 then base_nrib_3 = &last_base_rib_2 - (((&last_base_rib_2*0.10)/25) * (mob - &teaser_length));
+else base_nrib_3 = &last_base_rib_2 - (&last_base_rib_2*0.10);
+
+/*Truly Simple - 10 month gradual decline of 15%, then flat */
+if mob <= &teaser_length then base_nrib_28 = 0;
+else if mob >= &teaser_length and mob <= &teaser_length + 10 then base_nrib_28 = &last_base_rib_3 - (((&last_base_rib_3*0.15)/10) * (mob - &teaser_length));
+else base_nrib_28 = &last_base_rib_3 - (&last_base_rib_3*0.15);
+
+/*Truly Simple - 25 month gradual decline of 35%, then flat */
+if mob <= &teaser_length then base_nrib_29 = 0;
+else if mob >= &teaser_length and mob <= &teaser_length + 25 then base_nrib_29 = &last_base_rib_3 - (((&last_base_rib_3*0.35)/25) * (mob - &teaser_length));
+else base_nrib_29 = &last_base_rib_3 - (&last_base_rib_3*0.35);
+
+/*Truly Simple - 25 month gradual decline of 35%, then flat */
+if mob <= &teaser_length then base_nrib_30 = 0;
+else if mob >= &teaser_length and mob <= &teaser_length + 10 then base_nrib_30 = &last_base_rib_3 - (((&last_base_rib_3*0.20)/10) * (mob - &teaser_length));
+else base_nrib_30 = &last_base_rib_3 - (&last_base_rib_3*0.20);
+
+/*Truly Simple - 0% then 15% Reduction*/
+if mob <= &teaser_length then base_nrib_21 = 0;
+else if mob > &teaser_length and mob <= &teaser_length + 10 then base_nrib_21 = &last_base_rib_14 - ((mob - &teaser_length) * ((&last_base_rib_14*0.4)/10));
+else base_nrib_21 =  &last_base_rib_14 - &last_base_rib_14 * 0.4;
+
+/*Truly Simple - 0% then 15% Reduction*/
+if mob <= &teaser_length then base_nrib_22 = 0;
+else if mob > &teaser_length and mob <= &teaser_length + 6 then base_nrib_22 = &last_base_rib_15 - ((mob - &teaser_length) * ((&last_base_rib_15*0.35)/6));
+else base_nrib_22 =  &last_base_rib_15 - &last_base_rib_15 * 0.35;
+
+/*Truly Simple - 0% then 15% Reduction*/
+if mob <= &teaser_length then base_nrib_23 = 0;
+else if mob = &teaser_length + 1 then base_nrib_23 = &last_base_rib_16 - ((&last_base_rib_16*0.15)/3);
+else if mob = &teaser_length + 2 then base_nrib_23 = &last_base_rib_16 - ((&last_base_rib_16*0.15)/2);
+else if mob = &teaser_length + 3 then base_nrib_23 = &last_base_rib_16 - ((&last_base_rib_16*0.15)/1);
+else base_nrib_23 = &last_base_rib_16 - ((&last_base_rib_16*0.15)/1);
+
+/*Truly Simple - 0% then 0% Reduction*/
+if mob <= &teaser_length then base_nrib_24 = 0;
+else base_nrib_24 = &last_base_rib_16;
+
+
+/*Truly Simple - 0% then 15% Reduction*/
+if mob <= &teaser_length then base_nrib_25 = 0;
+else base_nrib_25 = &last_base_rib_6 - ((mob - &teaser_length) * (&last_base_rib_6*0.007));
+
+
+/*Truly Simple - 0% then 15% Reduction*/
+if mob <= &teaser_length then base_nrib_26 = 0;
+else if mob > &teaser_length and mob <= &teaser_length + 10 then base_nrib_26 = &last_base_rib_14 - ((mob - &teaser_length) * ((&last_base_rib_14*0.25)/10));
+else base_nrib_26 =  &last_base_rib_14 - &last_base_rib_14 * 0.25;
+
+/*Truly Simple - 10% then 20% Reduction*/
+if mob <= &teaser_length then base_nrib_27 = 0;
+else if mob > &teaser_length and mob <= &teaser_length + 20 then base_nrib_27 = &last_base_rib_3 - (((&last_base_rib_3*0.25)/20) * (mob - &teaser_length));
+else base_nrib_27 = &last_base_rib_3 - (&last_base_rib_3*0.25);
+
+output;
+end;
+
+run;
+
+
+proc sql;
+create table rib_final_0 as
+(select
+a.acct_key,
+a.segment_rib,
+a.multiplier,
+b.mob,
+b.base_rib_1,
+b.base_rib_2,
+b.base_rib_3,
+b.base_rib_4,
+b.base_rib_5,
+b.base_rib_6,
+b.base_rib_7,
+b.base_rib_8,
+b.base_rib_9,
+b.base_rib_10,
+b.base_rib_11,
+b.base_rib_12,
+b.base_rib_13,
+b.base_rib_14,
+b.base_rib_15,
+b.base_rib_16
+from
+(select * from rib_and_nrib_seg_and_multipliers) a, (select * from rib_base_curves) b)
+;
+quit;
+ 
+proc sort data=rib_final_0;
+by acct_key;
+run;
+ 
+data rib_final (keep= acct_key segment_rib mob rib);
+set rib_final_0;
+if segment_rib = 1 then rib = base_rib_1*multiplier;
+if segment_rib = 2 then rib = base_rib_2*multiplier;
+if segment_rib = 3 then rib = base_rib_3*multiplier;
+if segment_rib = 4 then rib = base_rib_4*multiplier;
+if segment_rib = 5 then rib = base_rib_5*multiplier;
+if segment_rib = 6 then rib = base_rib_6*multiplier;
+if segment_rib = 7 then rib = base_rib_7*multiplier;
+if segment_rib = 8 then rib = base_rib_8*multiplier;
+if segment_rib = 9 then rib = base_rib_9*multiplier;
+if segment_rib = 10 then rib = base_rib_10*multiplier;
+if segment_rib = 11 then rib = base_rib_11*multiplier;
+if segment_rib = 12 then rib = base_rib_12*multiplier;
+if segment_rib = 13 then rib = base_rib_13*multiplier;
+if segment_rib = 14 then rib = base_rib_14*multiplier;
+if segment_rib = 15 then rib = base_rib_15*multiplier;
+if segment_rib = 16 then rib = base_rib_16*multiplier;
+run;
+
+proc sql;
+create table nrib_final_0 as
+(select
+a.acct_key,
+a.segment_nrib,
+a.multiplier,
+b.mob,
+b.base_nrib_1,
+b.base_nrib_2,
+b.base_nrib_3,
+b.base_nrib_4,
+b.base_nrib_5,
+b.base_nrib_6,
+b.base_nrib_7,
+b.base_nrib_8,
+b.base_nrib_9,
+b.base_nrib_10,
+b.base_nrib_11,
+b.base_nrib_12,
+b.base_nrib_13,
+b.base_nrib_14,
+b.base_nrib_15,
+b.base_nrib_16,
+b.base_nrib_17,
+b.base_nrib_18,
+b.base_nrib_19,
+b.base_nrib_20,
+b.base_nrib_21,
+b.base_nrib_22,
+b.base_nrib_23,
+b.base_nrib_24,
+b.base_nrib_25,
+b.base_nrib_26,
+b.base_nrib_27,
+b.base_nrib_28,
+b.base_nrib_29,
+b.base_nrib_30
+
+from
+(select * from rib_and_nrib_seg_and_multipliers) a,
+(select * from nrib_base_curves) b)
+;
+quit;
+ 
+proc sort data=nrib_final_0;
+by acct_key;
+run;
+ 
+data nrib_final (keep= acct_key segment_nrib mob nrib);
+set nrib_final_0;
+if segment_nrib = 1 then nrib = base_nrib_1*multiplier;
+if segment_nrib = 2 then nrib = base_nrib_2*multiplier;
+if segment_nrib = 3 then nrib = base_nrib_3*multiplier;
+if segment_nrib = 4 then nrib = base_nrib_4*multiplier; 
+if segment_nrib = 5 then nrib = base_nrib_5*multiplier;
+if segment_nrib = 6 then nrib = base_nrib_6*multiplier;
+if segment_nrib = 7 then nrib = base_nrib_7*multiplier; 
+if segment_nrib = 8 then nrib = base_nrib_8*multiplier; 
+if segment_nrib = 9 then nrib = base_nrib_9*multiplier; 
+if segment_nrib = 10 then nrib = base_nrib_10*multiplier; 
+if segment_nrib = 11 then nrib = base_nrib_11*multiplier;
+if segment_nrib = 12 then nrib = base_nrib_12*multiplier; 
+if segment_nrib = 13 then nrib = base_nrib_13*multiplier; 
+if segment_nrib = 14 then nrib = base_nrib_14*multiplier;
+if segment_nrib = 15 then nrib = base_nrib_15*multiplier;
+if segment_nrib = 16 then nrib = base_nrib_16*multiplier; 
+if segment_nrib = 17 then nrib = base_nrib_17*multiplier; 
+if segment_nrib = 18 then nrib = base_nrib_18*multiplier; 
+if segment_nrib = 19 then nrib = base_nrib_19*multiplier; 
+if segment_nrib = 20 then nrib = base_nrib_20*multiplier;  
+if segment_nrib = 21 then nrib = base_nrib_21*multiplier;  
+if segment_nrib = 22 then nrib = base_nrib_22*multiplier;  
+if segment_nrib = 23 then nrib = base_nrib_23*multiplier;  
+if segment_nrib = 24 then nrib = base_nrib_24*multiplier;  
+if segment_nrib = 25 then nrib = base_nrib_25*multiplier;  
+if segment_nrib = 26 then nrib = base_nrib_26*multiplier;  
+if segment_nrib = 27 then nrib = base_nrib_27*multiplier;  
+if segment_nrib = 28 then nrib = base_nrib_28*multiplier;  
+if segment_nrib = 29 then nrib = base_nrib_29*multiplier; 
+if segment_nrib = 30 then nrib = base_nrib_30*multiplier;  
+run;
+
+/* End - Rate and Non-Rate Incented Revolving Balances/Open */
+
+
+/* Cash Balances/Open */
+/*8A)Cash Bal Segments*/
+data cash_bal_seg_and_multipliers;
+set scoring_dataset (keep=acct_key fico_scr_orig);  
+f_rewards = &rewards;
+channel2 = &channel;
+
+if f_rewards = 1 and channel2 not in ('Take-One','Pre-Screen') then do;
+        segment_cash_bal = 1;
+        if FICO_SCR_ORIG < 718 then multiplier = 3.00;
+        else if FICO_SCR_ORIG >= 718 and FICO_SCR_ORIG < 762 then multiplier = 1.40;
+        else if FICO_SCR_ORIG >= 762 and FICO_SCR_ORIG < 790 then multiplier = 0.40;
+        else if FICO_SCR_ORIG >= 790 then multiplier = 0.20;
+        end;
+else if f_rewards = 0 and channel2 = "DM Prospect" then do;
+        segment_cash_bal = 2;
+        if FICO_SCR_ORIG < 680 then multiplier = 1.30;
+        else if FICO_SCR_ORIG >= 680 and FICO_SCR_ORIG < 700 then multiplier = 1.30;
+        else if FICO_SCR_ORIG >= 700 and FICO_SCR_ORIG < 720 then multiplier = 1.30;
+		else if FICO_SCR_ORIG >= 720 and FICO_SCR_ORIG < 750 then multiplier = 0.80;
+		else if FICO_SCR_ORIG >= 750 and FICO_SCR_ORIG < 800 then multiplier = 0.25;
+        else if FICO_SCR_ORIG >= 800 then multiplier = 0.25;
+        end;
+else if f_rewards = 0 and channel2 = "DM Customer" then do;
+        segment_cash_bal = 2;
+        if FICO_SCR_ORIG < 718 then multiplier = 1.30;
+        else if FICO_SCR_ORIG >= 718 and FICO_SCR_ORIG < 762 then multiplier = 1.02;
+        else if FICO_SCR_ORIG >= 762 and FICO_SCR_ORIG < 790 then multiplier = 0.40;
+        else if FICO_SCR_ORIG >= 790 then multiplier = 0.20;
+        end;
+else if (channel2 = 'Take-One' or channel2 = 'Pre-Screen') and f_rewards = 1 then do;
+		segment_cash_bal = 3;
+		if FICO_SCR_ORIG < 660 then multiplier = 0.21;
+		else if FICO_SCR_ORIG < 680 then multiplier = 0.43;
+		else if FICO_SCR_ORIG < 700 then multiplier = 0.52;
+		else if FICO_SCR_ORIG < 720 then multiplier = 0.64;
+		else if FICO_SCR_ORIG < 750 then multiplier = 1.25;
+		else if FICO_SCR_ORIG < 800 then multiplier = 1.38;
+		else if FICO_SCR_ORIG <= 850 then multiplier = 1.38;
+		else multiplier = 1.00;
+		end;
+else if (channel2 = 'Take-One' or channel2 = 'Pre-Screen') and f_rewards = 0 then do;
+		segment_cash_bal = 4;
+		if FICO_SCR_ORIG < 660 then multiplier = 1.0;
+		else if FICO_SCR_ORIG < 680 then multiplier = 1.0;
+		else if FICO_SCR_ORIG < 700 then multiplier = 1.0;
+		else if FICO_SCR_ORIG < 720 then multiplier = 1.0;
+		else if FICO_SCR_ORIG < 750 then multiplier = 1.0;
+		else if FICO_SCR_ORIG < 800 then multiplier = 1.0;
+		else if FICO_SCR_ORIG <= 850 then multiplier = 1.0;
+		else multiplier = 1.00;
+		end;
+else segment_cash_bal = .;
+
+run;
+
+/*8B)Cash Bal Curves*/
+data cash_bal_base_curves;
+format mob comma12. base_cash_bal_1-base_cash_bal_2 comma12.2;
+
+do mob = 0 to 60;
+
+          /* Segment 1: Rewards */
+          if mob = 0 then base_cash_bal_1 = .25;
+                 else if mob > 0 and mob < 7 then base_cash_bal_1 = 10 + ((mob - 1)*5);
+                 else base_cash_bal_1 = 40;
+
+          /* Segment 2: Direct Mail & Non-Rewards */
+                 if mob = 0 then base_cash_bal_2 = .5;
+                 else if mob = 1 then base_cash_bal_2 = 20;
+                 else if mob = 2 then base_cash_bal_2 = 35;
+                 else if mob > 2 and mob < 7 then base_cash_bal_2 = 55 + ((mob -3)*5);
+                 else if mob >= 7 and mob < 11 then base_cash_bal_2 = 75;
+                 else base_cash_bal_2 = 75 - ((mob-10)*.4);
+
+          /* Segment 3: Take-One & Pre-Screen */
+                 if mob = 0 then base_cash_bal_3 = .5;
+                 else if mob = 1 then base_cash_bal_3 = 20;
+                 else if mob = 2 then base_cash_bal_3 = 35;
+                 else if mob > 2 and mob < 7 then base_cash_bal_3 = 55 + ((mob -3)*5);
+                 else if mob >= 7 and mob < 11 then base_cash_bal_3 = 75;
+                 else base_cash_bal_3 = 75 - ((mob-10)*.4);
+
+          /* Segment 4: Take-One & Pre-Screen */
+                 if mob = 0 then base_cash_bal_4 = .5;
+                 else if mob = 1 then base_cash_bal_4 = 20;
+                 else if mob = 2 then base_cash_bal_4 = 35;
+                 else if mob > 2 and mob < 7 then base_cash_bal_4 = 55 + ((mob -3)*5);
+                 else if mob >= 7 and mob < 11 then base_cash_bal_4 = 75;
+                 else base_cash_bal_4 = 75 - ((mob-10)*.4);
+
+          output;
+
+end;
+
+run;
+
+proc sql;
+create table cash_bal_final_0 as
+(select
+a.acct_key,
+a.segment_cash_bal,
+a.multiplier,
+b.mob,
+b.base_cash_bal_1,
+b.base_cash_bal_2,
+b.base_cash_bal_3,
+b.base_cash_bal_4
+from
+(select * from cash_bal_seg_and_multipliers) a,
+(select * from cash_bal_base_curves) b)
+;
+quit;
+
+proc sort data=cash_bal_final_0;
+by acct_key;
+run;
+
+data cash_bal_final (keep= acct_key segment_cash_bal mob cash_bal);
+set cash_bal_final_0;
+if segment_cash_bal = 1 then cash_bal = base_cash_bal_1*multiplier;
+if segment_cash_bal = 2 then cash_bal = base_cash_bal_2*multiplier;
+if segment_cash_bal = 3 then cash_bal = base_cash_bal_3*multiplier;
+if segment_cash_bal = 4 then cash_bal = base_cash_bal_4*multiplier;
+run;
+
+/* End - Cash/Open */
+
+/* BT Fee/Open */
+/*9A)BT Fee Segments*/
+
+data bt_fee_segments_and_multipliers;
+set scoring_dataset (keep=acct_key amt_orig_crlim fico_scr_orig);
+if &use_actual_cl = 'N' then AMT_ORIG_CRLIM = &credit_line; 
+f_rewards = &rewards;
+channel = &channel;
+
+		if f_rewards = 1 and FICO_SCR_ORIG < 800 then do;
+                segment_bt_fee = 1;
+                if AMT_ORIG_CRLIM < 6000 then multiplier = .15;
+                else if AMT_ORIG_CRLIM >= 6000 and AMT_ORIG_CRLIM < 7000 then multiplier = 2.15;
+                else if AMT_ORIG_CRLIM >= 7000 and AMT_ORIG_CRLIM < 12500 then multiplier = .55;
+                else if AMT_ORIG_CRLIM >= 12500 then multiplier = .38;
+				else multiplier = 0;
+              end;
+		else if f_rewards = 0 and FICO_SCR_ORIG < 800 then do;
+                segment_bt_fee = 2;
+                if AMT_ORIG_CRLIM < 4500 then multiplier = .45;*1.05;
+                else if AMT_ORIG_CRLIM >= 4500 and AMT_ORIG_CRLIM < 7500 then multiplier = 6.23;*5.93;
+                else if AMT_ORIG_CRLIM >= 7500 and AMT_ORIG_CRLIM < 12500 then multiplier = 8.45;*7.75;
+                else if AMT_ORIG_CRLIM >= 12500 then multiplier = 2.48;*8.262;
+				else multiplier = 0;
+              end;
+		else if f_rewards = 1 and FICO_SCR_ORIG >= 800 then do;
+                segment_bt_fee = 1;
+                if AMT_ORIG_CRLIM < 5000 then multiplier = .26;
+                else if AMT_ORIG_CRLIM >= 5000 and AMT_ORIG_CRLIM < 7500 then multiplier = .25;
+                else if AMT_ORIG_CRLIM >= 7500 and AMT_ORIG_CRLIM < 12500 then multiplier = .25;
+                else if AMT_ORIG_CRLIM >= 12500 then multiplier = .25;
+				else multiplier = 0;
+              end;
+		else if f_rewards = 0 and FICO_SCR_ORIG >= 800 then do;
+                segment_bt_fee = 2;
+                if AMT_ORIG_CRLIM < 4500 then multiplier = 1.32;
+                else if AMT_ORIG_CRLIM >= 4500 and AMT_ORIG_CRLIM < 7500 then multiplier = 1.32;
+                else if AMT_ORIG_CRLIM >= 7500 and AMT_ORIG_CRLIM < 12500 then multiplier = 1.32;
+                else if AMT_ORIG_CRLIM >= 12500 then multiplier = 1.32;
+              end;
+		else multiplier = 0;
+
+		if channel = "DM Prospect" then segment_bt_fee = segment_bt_fee + 2;
+		if channel = "DM Prospect" and f_rewards = 0 and FICO_SCR_ORIG >= 800 then multiplier = multiplier * 3.05;
+
+		if channel = "DM Prospect" and f_rewards = 1 and FICO_SCR_ORIG >= 800 and FICO_SCR_ORIG <= 850 then multiplier = multiplier * 0.15;
+		if channel = "DM Prospect" and f_rewards = 1 and FICO_SCR_ORIG >= 700 and FICO_SCR_ORIG < 750 then multiplier = multiplier * 3.50;
+		if channel = "DM Prospect" and f_rewards = 1 and FICO_SCR_ORIG < 700 then multiplier = multiplier * 4.00;
+
+		if channel = "DM Customer" and f_rewards = 1 and FICO_SCR_ORIG >= 680 and FICO_SCR_ORIG < 750 then multiplier = multiplier * 2.00;
+		if channel = "DM Customer" and f_rewards = 1 and FICO_SCR_ORIG < 860 then multiplier = multiplier * 2.00;
+		if channel = "DM Customer" and f_rewards = 1 and FICO_SCR_ORIG >= 750 and FICO_SCR_ORIG < 800 then multiplier = multiplier * 1.40;
+
+run;
+
+/*9B)BT Fee Curves*/
+data bt_fee_base_curves;
+format mob comma12. base_bt_fee_1-base_bt_fee_2 comma12.2;
+
+do mob = 0 to 60;
+
+          /* Segment 1: DM Customers */
+          if mob = 0 then base_bt_fee_1 = 4.25;
+			else if mob = 1 then base_bt_fee_1 = 4.75;
+			else if mob = 2 then base_bt_fee_1 = 1.2;
+			else if mob = 3 then base_bt_fee_1 = .7;
+			else if mob >= 4 and mob < 11 then base_bt_fee_1 = .15;
+			else if mob >= 11 and mob < 14 then base_bt_fee_1 = .15 + ((mob - 9)* .08);
+			else if mob >= 14 and mob < 17 then base_bt_fee_1 = .50;
+			else if mob >= 17 and mob < 19 then base_bt_fee_1 = .50 - ((mob - 16)* .05);
+			else base_bt_fee_1 = .35;
+
+		/* Segment 2: DM Prospects NOTE: this was not in recommendation to NPV stakeholders...may be a result of new card activation cross-sell */
+		/* This segment doesn't have a peak, it just starts very high. */
+          if mob = 0 then base_bt_fee_2 = 6.95;
+			else if mob = 1 then base_bt_fee_2 = 4.75;
+			else if mob = 2 then base_bt_fee_2 = 1.2;
+			else if mob = 3 then base_bt_fee_2 = .7;
+			else if mob >= 4 and mob < 11 then base_bt_fee_2 = .15;
+			else if mob >= 11 and mob < 14 then base_bt_fee_2 = .15 + ((mob - 9)* .08);
+			else if mob >= 14 and mob < 17 then base_bt_fee_2 = .50;
+			else if mob >= 17 and mob < 19 then base_bt_fee_2 = .50 - ((mob - 16)* .05);
+			else base_bt_fee_2 = .35;
+
+          output;
+
+end;
+
+run;
+
+proc sql;
+create table bt_fee_final_0 as
+(select
+a.acct_key,
+a.segment_bt_fee,
+a.multiplier,
+b.mob,
+b.base_bt_fee_1,
+b.base_bt_fee_2
+from
+(select * from bt_fee_segments_and_multipliers) a,
+(select * from bt_fee_base_curves) b)
+;
+quit;
+
+proc sort data=bt_fee_final_0;
+by acct_key;
+run;
+
+data bt_fee_final (keep= acct_key segment_bt_fee mob bt_fee);
+set bt_fee_final_0;
+if segment_bt_fee = 1 then bt_fee = base_bt_fee_1*multiplier;
+if segment_bt_fee = 2 then bt_fee = base_bt_fee_1*multiplier;
+if segment_bt_fee = 3 then bt_fee = base_bt_fee_2*multiplier;
+if segment_bt_fee = 4 then bt_fee = base_bt_fee_2*multiplier;
+run;
+
+/* End - BT Fee/Open */
+
+
+/* Cash Adv Fee/Open */
+/*10A)Cash Fee Segments*/
+
+data cash_fee_segs_and_multipliers;
+set scoring_dataset (keep=acct_key FICO_SCR_ORIG); 
+
+if FICO_SCR_ORIG >= 773 then do;
+        segment_cash_fee = 1;
+        multiplier = 1;
+        end;
+else if FICO_SCR_ORIG < 773 then do;
+        segment_cash_fee = 2;
+        multiplier = 1;
+        end;
+else segment_cash_fee = .;
+
+run;
+
+/*10B)Cash Fee Curves*/
+data cash_fee_base_curves;
+format mob comma12. base_cash_fee_1-base_cash_fee_2 comma12.2;
+
+do mob = 0 to 60;
+
+                 /* Curve for High FICO */
+                 base_cash_fee_1 = .13;
+
+                 /* Curve for all accounts */
+                 if mob = 0 then base_cash_fee_2 = .40;
+                 else if mob = 1 then base_cash_fee_2 = .66;
+                 else if mob >= 2 and mob < 15 then base_cash_fee_2 = .66 - ((mob - 1)* .0315);
+                 else base_cash_fee_2 = .25;
+          output;
+end;
+run;
+
+proc sql;
+create table cash_fee_final_0 as
+(select
+a.acct_key,
+a.segment_cash_fee,
+a.multiplier,
+b.mob,
+b.base_cash_fee_1,
+b.base_cash_fee_2
+from
+(select * from cash_fee_segs_and_multipliers) a,
+(select * from cash_fee_base_curves) b)
+;
+quit;
+
+proc sort data=cash_fee_final_0;
+by acct_key;
+run;
+
+data cash_fee_final (keep= acct_key segment_cash_fee mob cash_fee);
+set cash_fee_final_0;
+if segment_cash_fee = 1 then cash_fee = base_cash_fee_1*multiplier;
+if segment_cash_fee = 2 then cash_fee = base_cash_fee_2*multiplier;
+run;
+
+/* End - Cash Adv Fee/Open */
+
+/* late fee / open */
+/*11A)Late Fee Segments*/
+
+data pd_fee_segs_and_mults;
+set scoring_dataset (keep=acct_key fico_scr_orig amt_orig_crlim);  
+format segment_late_fee comma12. multiplier comma12.2;
+f_rewards = &rewards;
+channel2 = &channel;
+
+if f_rewards = 1 and channel2 = 'DM Prospect' then do;
+	segment_late_fee = 1;
+	if FICO_SCR_ORIG < 680 then multiplier = 7.15;
+	else if FICO_SCR_ORIG < 700 and FICO_SCR_ORIG >= 680 then multiplier = 5.10;
+	else if FICO_SCR_ORIG < 720 and FICO_SCR_ORIG >= 700 then multiplier = 3.10;
+	else if FICO_SCR_ORIG < 750 and FICO_SCR_ORIG >= 720 then multiplier = 2.05;
+	else if FICO_SCR_ORIG < 800 and FICO_SCR_ORIG >= 750 then multiplier = 0.70;
+	else if FICO_SCR_ORIG >= 800 then multiplier = 0.40;
+	end;
+else if f_rewards = 1 and channel2 = 'DM Customer'  then do;
+	segment_late_fee = 1;
+	if FICO_SCR_ORIG < 680 then multiplier = 4.40;
+	else if FICO_SCR_ORIG < 700 and FICO_SCR_ORIG >= 680 then multiplier = 4.00;
+	else if FICO_SCR_ORIG < 720 and FICO_SCR_ORIG >= 700 then multiplier = 3.90;
+	else if FICO_SCR_ORIG < 750 and FICO_SCR_ORIG >= 720 then multiplier = 2.40;
+	else if FICO_SCR_ORIG < 800 and FICO_SCR_ORIG >= 750 then multiplier = 1.20;
+	else if FICO_SCR_ORIG >= 800 then multiplier = 0.75;
+	end;
+else if channel2 = 'DM Customer' and f_rewards = 0 then do;
+	segment_late_fee = 2;
+	if FICO_SCR_ORIG < 660 then multiplier = 3.50;
+	else if FICO_SCR_ORIG < 680 then multiplier = 3.00;
+	else if FICO_SCR_ORIG < 700 then multiplier = 2.50;
+	else if FICO_SCR_ORIG < 720 then multiplier = 2.00;
+	else if FICO_SCR_ORIG < 750 then multiplier = 1.50;
+	else if FICO_SCR_ORIG < 800 then multiplier = 1.00;
+	else if FICO_SCR_ORIG <= 850 then multiplier = 0.50;
+	else multiplier = 1.00;
+	end;
+else if channel2 = 'DM Prospect' and f_rewards = 0 then do;
+	segment_late_fee = 2;
+	if FICO_SCR_ORIG < 660 then multiplier = 3.50;
+	else if FICO_SCR_ORIG < 680 then multiplier = 3.00;
+	else if FICO_SCR_ORIG < 700 then multiplier = 2.50;
+	else if FICO_SCR_ORIG < 720 then multiplier = 2.00;
+	else if FICO_SCR_ORIG < 750 then multiplier = 1.50;
+	else if FICO_SCR_ORIG < 800 then multiplier = 1.00;
+	else if FICO_SCR_ORIG <= 850 then multiplier = 0.50;
+	else multiplier = 1.00;
+	end;
+else if (channel2 = 'Take-One' or channel2 = 'Pre-Screen') and f_rewards = 1 then do;
+	segment_late_fee = 3;
+		if FICO_SCR_ORIG < 660 then multiplier = 2.16;
+		else if FICO_SCR_ORIG < 680 then multiplier = 1.98;
+		else if FICO_SCR_ORIG < 700 then multiplier = 1.76;
+		else if FICO_SCR_ORIG < 720 then multiplier = 1.38;
+		else if FICO_SCR_ORIG < 750 then multiplier = 1.14;
+		else if FICO_SCR_ORIG < 800 then multiplier = 0.54;
+		else if FICO_SCR_ORIG <= 850 then multiplier = 0.23;
+		else multiplier = 1.00;
+	end;
+else if (channel2 = 'Take-One' or channel2 = 'Pre-Screen') and f_rewards = 0 then do;
+	segment_late_fee = 3;
+		if FICO_SCR_ORIG < 660 then multiplier = 2.00;
+		else if FICO_SCR_ORIG < 680 then multiplier = 1.82;
+		else if FICO_SCR_ORIG < 700 then multiplier = 1.56;
+		else if FICO_SCR_ORIG < 720 then multiplier = 1.38;
+		else if FICO_SCR_ORIG < 750 then multiplier = 1.18;
+		else if FICO_SCR_ORIG < 800 then multiplier = 0.74;
+		else if FICO_SCR_ORIG <= 850 then multiplier = 0.27;
+		else multiplier = 1.00;
+	end;
+else segment_late_fee = .;
+
+run;
+
+/*11B)Late Fee Curves*/
+data late_fee_base_curves; 
+format mob comma12. base_late_fee_1-base_late_fee_2 comma12.2;
+
+do mob = 0 to 61;
+
+		/* Segment 1 -- DM Prospect and Customer, Rewards */
+		if mob < 3 then base_late_fee_1 = 0;
+		else base_late_fee_1 = 0.49;
+		
+		/* SEGMENT 2: DM Customer and Prospect NonRewards */
+		x = 1; /* Peak fee */
+		if mob < 4 then base_late_fee_2 = 0;
+		else base_late_fee_2 = x;
+		
+		/* SEGMENT 3: Take-One and Pre-Screen Rewards */
+		x = 1; /* Peak fee */
+		if mob < 4 then base_late_fee_3 = 0;
+		else base_late_fee_3 = x;
+
+
+		drop x;
+		output;	
+end;
+run;
+
+
+proc sql;
+create table late_fee_final_0 as
+(select
+a.acct_key,
+a.amt_orig_crlim,
+a.segment_late_fee,
+a.multiplier,
+b.mob,
+b.base_late_fee_1,
+b.base_late_fee_2,
+b.base_late_fee_3
+from
+(select * from pd_fee_segs_and_mults) a,
+(select * from late_fee_base_curves) b
+)
+;
+quit;
+
+proc sort data=late_fee_final_0;
+by acct_key;
+run;
+ 
+data late_fee_final (keep= acct_key segment_late_fee mob late_fee);
+set late_fee_final_0;
+if segment_late_fee = 1 then late_fee = base_late_fee_1*multiplier;
+else if segment_late_fee = 2 then late_fee = base_late_fee_2*multiplier;
+else if segment_late_fee = 3 then late_fee = base_late_fee_3*multiplier;
+run;
+
+
+/* End - late fee / open */
+
+/*12A)Attrition Segments*/
+
+data close_segs_and_mults;
+set scoring_dataset (keep=acct_key fico_scr_orig amt_orig_crlim);  
+format segment_attrition comma12. multiplier comma12.2;
+f_rewards = &rewards;
+channel2 = &channel;
+
+multiplier = 1.;
+
+if (channel2 = 'DM Prospect' or channel2 = 'Internet Prospect') and f_rewards = 1 and FICO_SCR_ORIG < 750 then DO;
+	segment_attrition = 1;
+	if FICO_SCR_ORIG < 720 then multiplier = 1.75;
+	else multiplier = 2;
+	end;
+else if (channel2 = 'DM Prospect' or channel2 = 'Internet Prospect') and f_rewards = 1 and FICO_SCR_ORIG >= 750 then do;
+	segment_attrition = 2;
+	multiplier = 1.15;
+	end;	
+else if (channel2 = 'DM Prospect' or channel2 = 'Internet Prospect') and f_rewards = 0 then do;
+    segment_attrition = 3;
+    if FICO_SCR_ORIG < 750 then multiplier = 1;
+    else if FICO_SCR_ORIG >= 750 and FICO_SCR_ORIG < 800 then multiplier = 1.25;
+	else if FICO_SCR_ORIG >= 800 then multiplier = 1.65;
+    end;
+else if (channel2 = 'DM Customer' or channel2 = 'Internet Customer') and f_rewards = 0 then do;
+    segment_attrition = 4;
+    if FICO_SCR_ORIG < 720 then multiplier = 0.80;
+    else if FICO_SCR_ORIG >= 720 and FICO_SCR_ORIG < 750 then multiplier = 1.00;
+	else if FICO_SCR_ORIG >= 750 then multiplier = 1.30;
+    end;
+else if (channel2 = 'DM Customer' or channel2 = 'Internet Customer') and f_rewards = 1 then do;
+    segment_attrition = 5;
+	multiplier = 1;
+	if FICO_SCR_ORIG < 720 then multiplier = 0.81;
+	end;
+else if (channel2 = 'Take-One' or channel2 = 'Pre-Screen') and f_rewards = 1 then do;
+	segment_attrition = 6;
+	IF FICO_SCR_ORIG < 700 THEN multiplier = .35;
+	ELSE IF FICO_SCR_ORIG < 750 THEN multiplier = .45;
+	ELSE multiplier = .56;
+	end;
+else if (channel2 = 'Take-One' or channel2 = 'Pre-Screen') and f_rewards = 0 then do;
+	segment_attrition = 7;
+	multiplier = 1;
+	end;
+else segment_attrition = .;
+run;
+
+/*12B)Attrition Curves*/
+data attrition_base_curves;
+format mob comma12. base_attrition_1-base_attrition_5 comma12.2;
+
+do mob = 0 to 61;
+		  
+          /* SEGMENT 1: DM Prospect Rewards FICO < 750 */
+		  /* period 1 MOB 0-4, y=j(dx+e)
+             period 2 MOB 5-60, y=k(ax+b+cx^2)*/
+
+			 d= 0.003498692; /* coefficient of x*/
+			 e= 0.001307211; /* intercept */
+		     a= -0.000264339;  /* coefficient of x */
+			 b= 0.009147908; /*intercept */
+			 c= 0.00000252291; /* coefficient of x^2 */
+			 m= 4; /*month when attrition rate reaches the peak */ 
+		     j= 1; /*multiplier for period 1*/
+			 k = 1.3; /*multiplier for period 2*/
+
+			if mob <= m then base_attrition_1 = j*(d*mob + e);
+			else if mob > m then base_attrition_1 = k*(a*mob + b + c*(mob**2));
+		  
+		  /* SEGMENT 2: DM Prospect Rewards FICO >= 750 */
+		  /* period 1 MOB 0-4, y=j(dx+e)
+             period 2 MOB 5-60, y=k(ax+b+cx^2)*/
+
+			 d= 0.008228913; /* coefficient of x*/
+			 e= 0.000780224; /* intercept */
+		     a= -0.000449459;  /* coefficient of x */
+			 b= 0.014882045; /*intercept */
+			 c= 0.00000400496; /* coefficient of x^2 */
+			 m= 4; /*month when attrition rate reaches the peak */ 
+		     j= 1; /*multiplier for period 1*/
+			 k = 1.6; /*multiplier for period 2*/
+
+			if mob <= m then base_attrition_2 = j*(d*mob + e);
+			else if mob >m then base_attrition_2 = k*(a*mob + b + c*(mob**2));
+
+		  /* SEGMENT 3: DM Prospect Non-Rewards */
+		  /* period 1 MOB 0-15, y=j*t
+             period 2 MOB 16-61, y=k*(ax+b+cx^2)*/
+
+			 t= 0.003433349; /* value of the flat line*/
+		     a= -0.000269523;  /* coefficient of x */
+			 b= 0.008520684; /*intercept */
+			 c= 0.00000255131; /* coefficient of x^2 */
+			 m= 15; /*month flat line ends */ 
+		     j= .85; /*multiplier for period 1*/
+			 k = 1; /*multiplier for period 2*/
+
+			if mob <= m then base_attrition_3 = j*t;
+			else if mob > m then base_attrition_3 = k*(a*mob + b + c*(mob**2));
+		  
+		  /* SEGMENT 4: DM Customer Non-Rewards */
+		  /* period 1 MOB 0-11, y=j*t
+             period 2 MOB 12-15, y=k*(cx+d)
+			 period 3 MOB 16-60, y=p*(ax+b+ex^2)*/
+
+			 t= 0.003486414; /* value of the flat line */
+		     c= 0.000447796; /* coefficient of x */
+			 d= -0.001734476; /* intercept */
+			 a= -0.000157499; /* coefficient of x */
+		     b= 0.005863906; /* intercept */
+			 e= 0.00000130897; /* coefficient of x^2 */
+			 m= 11; /*month flat line ends */
+			 n= 15; /*month attrition rate peaks at */
+		     j= 1.05; /*multiplier for period 1*/
+			 k = 1.05; /*multiplier for period 2*/
+			 p = 1.05; /*multiplier for period 3*/
+
+			if mob <= m then base_attrition_4 = j*t;
+			else if mob > m and mob <= n then base_attrition_4 = k*(c*mob + d);
+			else if mob > n then base_attrition_4 = p*(a*mob+b+e*(mob**2));
+		  
+		  /* SEGMENT 5: DM Customer Rewards */
+		  /* period 1 MOB 0-7, y=j*t
+             period 2 MOB 8-61, y=k*(ax+b)*/
+
+			 t= 0.006310082; /* value of the flat line */
+			 a= -0.0000686515; /* coefficient of x */
+		     b= 0.006790643; /* intercept */
+			 m= 7; /*month flat line ends */
+		     j= 1.3; /*multiplier for period 1*/
+			 k = 1.3; /*multiplier for period 2*/
+
+			if mob <= m then base_attrition_5 = j*t;
+			else if mob > m then base_attrition_5 = k*(a*mob+b);
+		  
+		  /* SEGMENT 6: Take-One Rewards */
+		  /* period 1 MOB 0-7, y=j*t
+             period 2 MOB 8-61, y=k*(ax+b)*/
+
+			 t= 0.006310082; * value of the flat line ;
+			 a= -0.0000686515; * coefficient of x ;
+		     b= 0.006790643; * intercept ;
+			 m= 7; *month flat line ends;
+		     j= 1.3; *multiplier for period 1;
+			 k = 1.3; *multiplier for period 2;
+
+			if mob <= m then base_attrition_6 = j*t;
+			else if mob > m then base_attrition_6 = k*(a*mob+b);
+		  
+		  /* SEGMENT 7: Take-One Non-Rewards */
+		  /* period 1 MOB 0-7, y=j*t
+             period 2 MOB 8-61, y=k*(ax+b)*/
+
+			 t= 0.006310082; /* value of the flat line */
+			 a= -0.0000686515; /* coefficient of x */
+		     b= 0.006790643; /* intercept */
+			 m= 7; /*month flat line ends */
+		     j= 1.3; /*multiplier for period 1*/
+			 k = 1.3; /*multiplier for period 2*/
+
+			if mob <= m then base_attrition_7 = j*t;
+			else if mob > m then base_attrition_7 = k*(a*mob+b);
+		  
+		  /* TODO: complete assumptions for base curve for other segments */
+		  /* NOTE: other segments were exclude to expedite usability for Q1 2018 DM decision */
+
+          drop a b c d e m n j k t p;
+          output;
+
+end;
+run;
+
+
+proc sql;
+create table attrition_final_0 as
+(select
+a.acct_key,
+a.amt_orig_crlim,
+a.segment_attrition,
+a.multiplier,
+b.mob,
+b.base_attrition_1,
+b.base_attrition_2,
+b.base_attrition_3,
+b.base_attrition_4,
+b.base_attrition_5,
+b.base_attrition_6,
+b.base_attrition_7
+from
+(select * from close_segs_and_mults) a,
+(select * from attrition_base_curves) b
+)
+;
+quit;
+
+proc sort data=attrition_final_0;
+by acct_key;
+run;
+ 
+
+data attrition_final (keep= acct_key segment_attrition mob attrition multiplier);
+set attrition_final_0;
+if segment_attrition = 1 then attrition = base_attrition_1*multiplier;
+else if segment_attrition = 2 then attrition = base_attrition_2*multiplier;
+else if segment_attrition = 3 then attrition = base_attrition_3*multiplier;
+else if segment_attrition = 4 then attrition = base_attrition_4*multiplier;
+else if segment_attrition = 5 then attrition = base_attrition_5*multiplier;
+else if segment_attrition = 6 then attrition = base_attrition_6*multiplier;
+else if segment_attrition = 7 then attrition = base_attrition_7*multiplier;
+run;
+/* End - attrition / open */
+
+/*13A)Premium Segments*/
+
+data premium_segs_and_pass_rates;
+set scoring_dataset (keep=acct_key FICO_SCR_ORIG offer_type_0 premium); 
+f_rewards = &rewards;
+channel = &channel;
+
+if f_rewards = 0 then do;        
+        segment_premium_expense = 1;
+        pass_rate = 0;
+        end;
+
+else if f_rewards = 1 and channel = "DM Customer" then do; 
+        segment_premium_expense = 2;
+        if FICO_SCR_ORIG < 680 then pass_rate = .708;
+        else if FICO_SCR_ORIG >= 680 and FICO_SCR_ORIG < 700 then pass_rate = .680;
+        else if FICO_SCR_ORIG >= 700 and FICO_SCR_ORIG < 720 then pass_rate = .664;
+		else if FICO_SCR_ORIG >= 720 and FICO_SCR_ORIG < 750 then pass_rate = .581;
+		else if FICO_SCR_ORIG >= 750 and FICO_SCR_ORIG < 800 then pass_rate = .718;
+        else if FICO_SCR_ORIG >= 800 then pass_rate = .731;       
+        end;
+
+else if f_rewards = 1 and channel = "DM Prospect" and offer_type_0 = 'TRIO $100/$500' then do; 
+        segment_premium_expense = 3;
+        if FICO_SCR_ORIG < 680 then pass_rate = .498;
+        else if FICO_SCR_ORIG >= 680 and FICO_SCR_ORIG < 700 then pass_rate = .498;
+        else if FICO_SCR_ORIG >= 700 and FICO_SCR_ORIG < 720 then pass_rate = .526;
+		else if FICO_SCR_ORIG >= 720 and FICO_SCR_ORIG < 750 then pass_rate = .526;
+		else if FICO_SCR_ORIG >= 750 and FICO_SCR_ORIG < 800 then pass_rate = .533;
+        else if FICO_SCR_ORIG >= 800 then pass_rate = .533;       
+        end;
+
+else if f_rewards = 1 and channel = "DM Prospect" and offer_type_0 = 'TRIO $100 for $1,500' then do; 
+        segment_premium_expense = 4;
+        if FICO_SCR_ORIG < 680 then pass_rate = .238;
+        else if FICO_SCR_ORIG >= 680 and FICO_SCR_ORIG < 700 then pass_rate = .238;
+        else if FICO_SCR_ORIG >= 700 and FICO_SCR_ORIG < 720 then pass_rate = .301;
+		else if FICO_SCR_ORIG >= 720 and FICO_SCR_ORIG < 750 then pass_rate = .301;
+		else if FICO_SCR_ORIG >= 750 and FICO_SCR_ORIG < 800 then pass_rate = .432;
+        else if FICO_SCR_ORIG >= 800 then pass_rate = .432;       
+        end;
+
+else if f_rewards = 1 and channel = "DM Prospect" and offer_type_0 = 'TRIO $150/$500' then do; 
+        segment_premium_expense = 5;
+        if FICO_SCR_ORIG < 680 then pass_rate = .533;
+        else if FICO_SCR_ORIG >= 680 and FICO_SCR_ORIG < 700 then pass_rate = .533;
+        else if FICO_SCR_ORIG >= 700 and FICO_SCR_ORIG < 720 then pass_rate = .595;
+		else if FICO_SCR_ORIG >= 720 and FICO_SCR_ORIG < 750 then pass_rate = .595;
+		else if FICO_SCR_ORIG >= 750 and FICO_SCR_ORIG < 800 then pass_rate = .660;
+        else if FICO_SCR_ORIG >= 800 then pass_rate = .660;       
+        end;
+
+else segment_premium_expense = .;
+
+run;
+
+/*13B)Premium Curves*/
+data premium_expense_base_curve;
+format mob comma12. base_premium_expense comma12.2;
+
+do mob = 0 to 60;  
+
+                 /* Curve for all accounts */
+                 if mob = 3 then base_premium_expense = 1;
+                 else base_premium_expense = 0;
+          output;
+end;
+run;
+
+
+
+proc sql;
+create table premium_expense_final_0 as
+(select
+a.acct_key,
+a.segment_premium_expense,
+a.pass_rate,
+a.premium,
+b.mob,
+b.base_premium_expense
+from
+(select * from premium_segs_and_pass_rates) a,
+(select * from premium_expense_base_curve) b)
+;
+quit;
+
+proc sort data=premium_expense_final_0;
+by acct_key;
+run;
+
+data premium_expense_final (keep= pass_rate premium acct_key segment_premium_expense mob base_premium_expense premium_expense);
+set premium_expense_final_0;
+if segment_premium_expense = 0 then premium_expense = base_premium_expense * premium * pass_rate *&include_premium;
+if segment_premium_expense = 1 then premium_expense = base_premium_expense * premium * pass_rate *&include_premium;
+if segment_premium_expense = 2 then premium_expense = base_premium_expense * premium * pass_rate *&include_premium;
+if segment_premium_expense = 3 then premium_expense = base_premium_expense * premium * pass_rate *&include_premium;
+if segment_premium_expense = 4 then premium_expense = base_premium_expense * premium * pass_rate *&include_premium;
+if segment_premium_expense = 5 then premium_expense = base_premium_expense * premium * pass_rate *&include_premium;
+run;
+
+
+
+
+
+/* Consolidated Driver Assumption Table */
+/*14 Aggregate Drivers*/
+data mobs;
+format mob comma12.; 
+do mob = 0 to 60;
+	output;
+end;
+run;
+
+proc sql;
+create table accts_w_mobs as
+select 
+a.acct_key,
+a.fico_scr_orig,
+a.campaign_desc,
+a.bau_flag,
+a.credit_flag,
+&rewards as rewards,
+&teaser_length as teaser_length,
+a.offer_type_0,
+a.apr,
+&channel as channel,
+b.mob
+from
+(select * from scoring_dataset) a, (select * from mobs) b
+;
+quit;
+
+
+proc sort data=accts_w_mobs;
+by acct_key;
+run;
+
+proc sql;
+create table driver_assumptions as
+select 
+a.acct_key,
+a.fico_scr_orig,
+a.mob,
+a.rewards,
+a.teaser_length,
+a.apr,
+a.channel,
+a.offer_type_0,
+a.campaign_desc,
+a.bau_flag,
+a.credit_flag,
+pvol.pvol,
+cl.credit_line,
+coff.coff,
+close.attrition as close,
+nrib.nrib,
+rib.rib,
+cash_bal.cash_bal,
+bt_fee.bt_fee,
+late_fee.late_fee,
+cash_fee.cash_fee,
+premium_expense.premium_expense
+from
+(select * from accts_w_mobs) a
+left join
+(select * from pvol_final) pvol
+on a.acct_key = pvol.acct_key and a.mob = pvol.mob
+left join
+(select * from cl_final) cl
+on a.acct_key = cl.acct_key and a.mob = cl.mob
+left join
+(select * from coff_final) coff
+on a.acct_key = coff.acct_key and a.mob = coff.mob
+left join
+(select * from nrib_final) nrib
+on a.acct_key = nrib.acct_key and a.mob = nrib.mob
+left join
+(select * from rib_final) rib
+on a.acct_key = rib.acct_key and a.mob = rib.mob
+left join
+(select * from cash_bal_final) cash_bal
+on a.acct_key = cash_bal.acct_key and a.mob = cash_bal.mob
+left join
+(select * from bt_fee_final) bt_fee
+on a.acct_key = bt_fee.acct_key and a.mob = bt_fee.mob
+left join
+(select * from cash_fee_final) as cash_fee
+on a.acct_key = cash_fee.acct_key and a.mob = cash_fee.mob
+left join
+(select * from late_fee_final) as late_fee 
+on a.acct_key = late_fee.acct_key and a.mob = late_fee.mob
+left join
+(select * from attrition_final) as close
+on a.acct_key = close.acct_key and a.mob = close.mob
+left join
+(select * from premium_expense_final) as premium_expense
+on a.acct_key = premium_expense.acct_key and a.mob = premium_expense.mob
+;
+quit;
+
+/* Add statements for the sake of terminal value calculations*/
+proc sql;
+create table driver_assumptions_M60 as 
+select * from driver_assumptions where mob = 60;
+quit;
+
+data mobs_tv;
+format mob comma12.; 
+do mob = 61 to 84;
+	output;
+end;
+run;
+
+proc sql;
+create table driver_assumptions_tv as
+select
+a.acct_key,
+a.fico_scr_orig,
+a.rewards,
+a.teaser_length,
+a.apr,
+a.channel,
+a.campaign_desc,
+a.bau_flag,
+a.credit_flag,
+a.offer_type_0,
+b.mob,
+a.pvol,
+a.credit_line,
+a.coff,
+a.close,
+a.nrib,
+a.rib,
+a.cash_bal,
+a.bt_fee,
+a.late_fee,
+a.cash_fee,
+a.premium_expense
+from
+(select * from driver_assumptions_M60) a, (select * from mobs_tv) b;
+quit;
+
+data driver_assumptions_w_tv;
+set driver_assumptions driver_assumptions_tv;
+run;
+
+proc sort data=driver_assumptions_w_tv;
+by acct_key;
+run;
+
+data actual_performance_0;
+set &spr_results.;
+bt_fee = sum(NET_BT_PUR_V3, NET_BT_PUR_OTH_V3, NET_BT_CC_CSH_V3, NET_BT_CC_CSH_OTH_V3)*0.0375;
+run;
+
+proc sql;
+create table actual_performance as
+select 
+a.acct_key,
+a.fico_scr_orig,
+a.mob,
+a.rewards,
+a.teaser_length,
+a.apr,
+a.channel,
+a.offer_type_0,
+perf.DQ60Ever,
+perf.clean_up_flag,
+perf.net_purchase_v3 as pvol,
+perf.amt_crlim as credit_line,
+perf.close_flag as close,
+perf.coff_flag as coff,
+perf.amt_adb_nri as nrib,
+perf.amt_adb_ri as rib,
+perf.amt_adb_cash as cash_bal,
+perf.bt_fee,
+perf.net_fee_cash_adv_v3 as cash_fee,
+perf.net_fee_late_pmt_v3 as late_fee
+from
+(select * from accts_w_mobs) a
+left join
+(select * from actual_performance_0) perf
+on a.acct_key = perf.acct_key and a.mob = perf.month_on_book_f
+;
+quit;
+
+
+/* End - Consolidated Driver Assumption Table */
+
+/*15 Apply Factors and Calculate Cash Flows*/
+
+%macro cash_flow_creation(perf_table,type_run,scenario);
+
+data adjusted&perf_table;
+set  &perf_table;
+	if &scenario = 'stress case' then do;
+		bt_fee = bt_fee*&bt_fee_sc_var;
+		cash_bal = cash_bal*&cash_bal_sc_var;
+		cash_fee= cash_fee*&cash_fee_sc_var;
+		close = close*&close_sc_var;
+		coff = coff*&coff_sc_var;
+		credit_line = credit_line*&credit_line_sc_var;
+		late_fee = late_fee*&late_fee_sc_var;
+		nrib = nrib*&nrib_sc_var;
+		pvol = pvol*&pvol_sc_var;
+		rib = rib*&rib_sc_var;
+		end;	
+run;
+
+
+/* Net Income Calculation */
+data cash_flow_0_&type_run;
+set adjusted&perf_table;
+by acct_key;
+
+retain open_orig coff_orig close_orig;
+if first.acct_key then do;
+	open_orig = 1; 
+	coff_orig = coff*open_orig;
+	close_orig = close*open_orig;
+end;
+else do;
+	open_orig = sum(open_orig, - coff_orig, - close_orig);
+	coff_orig = coff*open_orig;
+	close_orig = close*open_orig;
+end;
+run;
+
+
+data cash_flow_&type_run;
+set cash_flow_0_&type_run;
+pvol_orig = pvol*open_orig;
+
+if rewards = 1 then interchange_rate = &interchange_trio;
+else if rewards = 0 then interchange_rate = &interchange_ts;
+if fico_scr_orig >= 800
+	then gaco_orig = credit_line*&severity_gt_800*coff_orig;
+else gaco_orig = credit_line*&severity_lt_800*coff_orig;
+
+recoveries_orig = gaco_orig*&recovery_rate;
+nrib_orig = nrib*open_orig;
+rib_orig = rib*open_orig;
+cash_bal_orig = cash_bal*open_orig;
+total_bal_orig = sum(nrib_orig, rib_orig, cash_bal_orig, pvol_orig);
+bt_fee_orig = bt_fee*open_orig;
+cash_fee_orig = cash_fee*open_orig;
+late_fee_orig = late_fee*open_orig;
+
+rev_interchange_orig = pvol_orig*interchange_rate;
+rev_bt_fee_orig = bt_fee_orig*&fc_collectability;
+rev_interest_nrib_orig = nrib_orig*(apr/12)*&fc_collectability;
+rev_interest_cash_bal_orig = cash_bal_orig*(&cash_apr/12)*&fc_collectability;
+rev_cash_fee_orig = cash_fee_orig*&fc_collectability;
+rev_late_fee_orig = late_fee_orig*&fc_collectability;
+
+exp_naco_orig = gaco_orig-recoveries_orig;
+exp_cof_orig = total_bal_orig*(1-&equity_rate)*(&cost_of_funds/12);
+exp_epp_orig = pvol_orig*&EPP_network_fees;
+exp_premium_orig = premium_expense * open_orig;
+exp_purchase_fraud_orig = pvol_orig*&fraud_expense;
+if rewards = 1 
+	then exp_rewards_orig = pvol_orig*&points_earn_per_dollar*&CPP*&rewards_breakage;
+else exp_rewards_orig = 0;
+
+if mob = 0
+	then exp_new_account_setup = &new_account_setup;
+else exp_new_account_setup = 0;
+exp_operations_orig = (&OPS_allocation/12)*open_orig;
+exp_collections_orig = (&collections/12)*open_orig;
+exp_financial_center_cost_orig = (&financial_center_cost/12)*open_orig;
+ 
+total_revenue = sum(rev_interchange_orig, rev_interest_nrib_orig, 
+rev_interest_cash_bal_orig, rev_bt_fee_orig, rev_cash_fee_orig,
+rev_late_fee_orig);
+total_expense = sum(exp_naco_orig, exp_cof_orig, exp_epp_orig, 
+exp_purchase_fraud_orig, exp_rewards_orig, exp_new_account_setup,
+exp_operations_orig, exp_collections_orig, exp_financial_center_cost_orig, exp_premium_orig);
+
+required_equity = total_bal_orig*&equity_rate;
+NIBT = total_revenue-total_expense;
+NIAT = NIBT*(1-&tax_rate);
+
+run;
+
+/* End - Net Income Calculation */
+
+data cash_flow_equity_flow_&type_run (drop=prior_required_equity);
+set cash_flow_&type_run;
+by acct_key;
+retain required_equity equity_flow prior_required_equity;
+if first.acct_key then do;
+	equity_flow = -required_equity;
+    prior_required_equity = required_equity;
+end;
+else do;
+	equity_flow = -sum(required_equity, -prior_required_equity);
+    prior_required_equity = required_equity;
+end;
+run;
+
+
+/* PV Calculation */
+data PV_&type_run;
+set cash_flow_equity_flow_&type_run;
+discount_factor = 1/(1+&discount_rate)**(mob/12);
+income_plus_equity_flow = NIAT+equity_flow;
+discounted_pv_no_equity = discount_factor*NIAT;
+discounted_pv_w_equity = discount_factor*(income_plus_equity_flow);
+run;
+
+/* Terminal Value */
+proc sql;
+create table year_4_income_p_equity_&type_run as
+select 
+acct_key,
+sum(income_plus_equity_flow) as y4_income_p_equity
+from PV_&type_run where mob >= 37 and mob <= 48
+group by 1;
+quit;
+
+proc sql;
+create table year_5_income_p_equity_&type_run as
+select 
+acct_key,
+sum(income_plus_equity_flow) as y5_income_p_equity
+from PV_&type_run where mob >= 49 and mob <= 60
+group by 1;
+quit;
+
+proc sql;
+create table base_pv_&type_run as
+select 
+acct_key,
+sum(discounted_pv_w_equity)+ sum(exp_premium_orig) as disc_base_pv
+from PV_&type_run where mob <= 60
+group by 1;
+quit;
+
+proc sql;
+create table growth_rate_&type_run as
+select 
+a.acct_key,
+((b.y5_income_p_equity/a.y4_income_p_equity)-1) as growth_rate,
+b.y5_income_p_equity,
+a.y4_income_p_equity,
+c.disc_base_pv
+from
+(select * from year_4_income_p_equity_&type_run) a
+left join
+(select * from year_5_income_p_equity_&type_run) b
+on a.acct_key = b.acct_key
+left join
+(select * from base_pv_&type_run) c
+on a.acct_key = c.acct_key
+;
+quit;
+
+data growth_rate_1&type_run; 
+set growth_rate_&type_run;
+if growth_rate > 0 then growth_rate = 0;
+run;
+
+data terminal_value_&type_run;
+set growth_rate_1&type_run;
+discount_factor_m60 = 1/(1+&discount_rate)**(60/12);
+non_disc_tv =  (y5_income_p_equity*(1+growth_rate))/(&discount_rate-growth_rate);
+disc_tv = discount_factor_m60*non_disc_tv;
+run;
+
+/* PV Calculation with Discounted Terminal Value and Recoverable Equity */
+proc sql;
+create table PV_w_TV_&type_run as 
+select
+a.*,
+b.disc_base_pv,
+b.disc_tv,
+min(abs(b.disc_tv),abs(b.disc_base_pv))* -1 as negtv,
+min(b.disc_tv,b.disc_base_pv) as postv,
+case 
+when b.disc_tv < 0 and b.disc_base_pv < 0 then calculated negtv
+when b.disc_tv < 0 and b.disc_base_pv >= 0 then calculated negtv 
+when b.disc_tv >= 0 and b.disc_base_pv >= 0 then calculated postv
+when b.disc_tv >= 0 and b.disc_base_pv < 0 then calculated postv
+
+end as disc_terminal_value
+from 
+(select * from PV_&type_run where mob <= 60) a
+left join
+(select * from terminal_value_&type_run) b
+on a.acct_key = b.acct_key and a.mob = 60
+;
+quit;
+
+proc sort data=PV_w_TV_&type_run;
+by acct_key mob;
+run;
+
+%mend;
+
+%cash_flow_creation(driver_assumptions_w_tv,pred,&case_type)
+%cash_flow_creation(actual_performance,act,'base') 
+
+proc contents data=PV_w_TV_pred;
+run;
+
+proc contents data=PV_w_TV_act;
+run;
+
+/*16 Create PV Waterfall*/
+/*Export this table to PV_Waterfall Excel*/
+
+proc sql;
+create table pv_waterfall as
+(select 
+case 
+when fico_scr_orig >= 600 and fico_scr_orig < 620 then 'FICO 600-619'	
+when fico_scr_orig >= 620 and fico_scr_orig < 640 then 'FICO 620-639'
+when fico_scr_orig >= 640 and fico_scr_orig < 660 then 'FICO 640-659'		
+when fico_scr_orig >= 660 and fico_scr_orig < 680 then 'FICO 660-679'		
+when fico_scr_orig >= 680 and fico_scr_orig < 700 then 'FICO 680-699'		
+when fico_scr_orig >= 700 and fico_scr_orig < 720 then 'FICO 700-719'		
+when fico_scr_orig >= 720 and fico_scr_orig < 750 then 'FICO 720-749'		
+when fico_scr_orig >= 750 and fico_scr_orig < 800 then 'FICO 750-799'		
+when fico_scr_orig >= 800 and fico_scr_orig <= 850 then 'FICO 800+'		
+when fico_scr_orig < 600 then 'FICO <600'	
+else 'Exclude'		
+end as FICO_group,
+mob,
+offer_type_0,
+channel,
+count(acct_key) as acct_key,
+sum(open_orig) as open_orig,
+sum(coff_orig) as coff_orig,
+sum(close_orig) as close_orig,
+sum(credit_line) as credit_line,
+sum(pvol_orig) as pvol_orig,
+sum(nrib_orig) as nrib_orig,
+sum(rib_orig) as rib_orig,
+sum(cash_bal_orig) as cash_bal_orig,
+sum(total_bal_orig) as total_bal_orig, 
+
+sum(rev_interchange_orig) as rev_interchange_orig,
+sum(rev_bt_fee_orig) as rev_bt_fee_orig,
+sum(rev_interest_nrib_orig) as rev_interest_nrib,
+sum(rev_interest_cash_bal_orig) as rev_interest_cash_bal_orig,
+sum(rev_cash_fee_orig) as rev_cash_fee_orig,
+sum(rev_late_fee_orig) as rev_late_fee_orig,
+
+sum(gaco_orig) as gaco_orig,
+sum(recoveries_orig) as recoveries_orig,
+sum(exp_naco_orig) as exp_naco_orig,
+sum(exp_cof_orig) as exp_cof_orig,
+sum(exp_epp_orig) as exp_epp_orig,
+sum(exp_purchase_fraud_orig) as exp_purchase_fraud_orig,
+sum(exp_rewards_orig) as exp_rewards_orig,
+sum(exp_new_account_setup) as exp_new_account_setup,
+sum(exp_operations_orig) as exp_operations_orig,
+sum(exp_collections_orig) as exp_collections_orig,
+sum(exp_financial_center_cost_orig) as exp_financial_center_cost_orig,
+sum(exp_premium_orig) as exp_premium_orig,
+sum(total_revenue) as total_revenue,
+sum(total_expense) as total_expense,
+sum(NIBT) as NIBT,
+sum(NIAT) as NIAT,
+
+sum(required_equity) as required_equity,
+sum(equity_flow) as equity_flow,
+sum(discount_factor) as discount_factor,
+sum(income_plus_equity_flow) as income_plus_equity_flow,
+
+sum(discounted_pv_no_equity) as discounted_pv_no_equity,
+sum(discounted_pv_w_equity) as discounted_pv_w_equity,
+sum(disc_terminal_value) as discounted_tv
+from PV_w_TV_pred
+group by 1,2,3,4);
+quit;
+
+
+proc sql;
+create table blah
+as 
+select
+acct_key,
+disc_terminal_value,
+disc_base_pv
+from PV_w_TV_pred
+where mob = 60
+group by 1;
+run;
+
+proc sql;
+	create table temppredpv as
+		select
+			a.acct_key,
+			a.mob ,
+			a.fico_scr_orig,
+			a.teaser_length ,		
+			a.channel ,		
+			a.bau_flag,
+			a.credit_flag,
+			a.credit_line as amt_orig_crlim,	
+			a.acct_key as acct_key,
+			a.pvol  AS pvol_pred,
+			a.close  AS close_pred,
+			a.coff as coff_pred,
+			a.nrib  AS nrib_pred,
+			a.rib  AS rib_pred,
+			a.cash_bal  AS cash_bal_pred,
+			a.bt_fee  AS bt_fee_pred,		
+			a.total_bal_orig as total_bal_pred,
+			a.credit_line as credit_line_pred,
+			a.open_orig  AS open_orig_pred,
+			a.close_orig  AS close_orig_pred,
+			a.coff_orig  AS coff_orig_pred,	         	      
+		    b.offer_type_0 as offer_type_0
+	
+			
+		from (select * from PV_w_TV_pred) a 		
+		          left join (select * from &driver_table.) b on a.acct_key = b.acct_key
+	;          
+quit;
+
+
+proc sql;
+	create table pred_pv_curves as
+		select
+
+			case
+
+				when fico_scr_orig >= 600 and fico_scr_orig < 620 then 'FICO 600-619'	
+				when fico_scr_orig >= 620 and fico_scr_orig < 640 then 'FICO 620-639'
+				when fico_scr_orig >= 640 and fico_scr_orig < 660 then 'FICO 640-659'		
+				when fico_scr_orig >= 660 and fico_scr_orig < 680 then 'FICO 660-679'		
+				when fico_scr_orig >= 680 and fico_scr_orig < 700 then 'FICO 680-699'		
+				when fico_scr_orig >= 700 and fico_scr_orig < 720 then 'FICO 700-719'		
+				when fico_scr_orig >= 720 and fico_scr_orig < 750 then 'FICO 720-749'		
+				when fico_scr_orig >= 750 and fico_scr_orig < 800 then 'FICO 750-799'		
+				when fico_scr_orig >= 800 and fico_scr_orig <= 850 then 'FICO 800+'		
+				when fico_scr_orig < 600 then 'FICO <600'	
+				else 'Exclude'		
+			end 
+		as FICO_group,		    
+			mob,
+			channel,		            
+			offer_type_0,									
+			count(acct_key) as num_accts,
+			count(distinct acct_key) as unique_accts,
+
+			SUM(pvol_pred) AS pvol_pred,
+			SUM(close_pred) AS close_pred,
+			SUM(coff_pred) AS coff_pred,
+			SUM(nrib_pred) AS nrib_pred,
+			SUM(rib_pred) AS rib_pred,
+			SUM(cash_bal_pred ) AS cash_bal_pred,
+			SUM(bt_fee_pred ) AS bt_fee_pred,			
+			sum(total_bal_pred) as total_bal_pred,
+			sum(credit_line_pred) as credit_line_pred,
+			SUM(open_orig_pred ) AS open_orig_pred,
+			SUM(close_orig_pred ) AS close_orig_pred,
+			SUM(coff_orig_pred ) AS coff_orig_pred
+			
+			
+			from temppredpv
+			group by 1,2,3,4
+	;
+quit;
+
+
+/*data conspay.mc_predicted_curves_201802;*/
+/*set pred_pv_curves;*/
+/*run;*/
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+proc sql;
+	create table temppredpv as
+		select
+			a.acct_key,
+			a.mob ,
+			a.fico_scr_orig,
+			a.teaser_length ,		
+			a.channel ,		
+			a.bau_flag,
+			a.credit_flag,
+			a.credit_line as amt_orig_crlim,	
+			a.acct_key as acct_key,
+			a.pvol  AS pvol_pred,
+			a.close  AS close_pred,
+			a.coff as coff_pred,
+			a.nrib  AS nrib_pred,
+			a.rib  AS rib_pred,
+			a.cash_bal  AS cash_bal_pred,
+			a.bt_fee  AS bt_fee_pred,		
+			a.total_bal_orig as total_bal_pred,
+			a.credit_line as credit_line_pred,
+			a.open_orig  AS open_orig_pred,
+			a.close_orig  AS close_orig_pred,
+			a.coff_orig  AS coff_orig_pred,	         	      
+		    b.offer_type_0 as offer_type_0
+	
+			
+		from (select * from PV_w_TV_pred) a 		
+		          left join (select * from &driver_table.) b on a.acct_key = b.acct_key
+	;          
+quit;
+
+
+proc sql;
+	create table pred_pv_curves as
+		select
+
+			case
+
+				when fico_scr_orig >= 600 and fico_scr_orig < 620 then 'FICO 600-619'	
+				when fico_scr_orig >= 620 and fico_scr_orig < 640 then 'FICO 620-639'
+				when fico_scr_orig >= 640 and fico_scr_orig < 660 then 'FICO 640-659'		
+				when fico_scr_orig >= 660 and fico_scr_orig < 680 then 'FICO 660-679'		
+				when fico_scr_orig >= 680 and fico_scr_orig < 700 then 'FICO 680-699'		
+				when fico_scr_orig >= 700 and fico_scr_orig < 720 then 'FICO 700-719'		
+				when fico_scr_orig >= 720 and fico_scr_orig < 750 then 'FICO 720-749'		
+				when fico_scr_orig >= 750 and fico_scr_orig < 800 then 'FICO 750-799'		
+				when fico_scr_orig >= 800 and fico_scr_orig <= 850 then 'FICO 800+'		
+				when fico_scr_orig < 600 then 'FICO <600'	
+				else 'Exclude'		
+			end 
+		as FICO_group,		    
+			mob,
+			channel,		            
+			offer_type_0,									
+			count(acct_key) as num_accts,
+			count(distinct acct_key) as unique_accts,
+
+			SUM(pvol_pred) AS pvol_pred,
+			SUM(close_pred) AS close_pred,
+			SUM(coff_pred) AS coff_pred,
+			SUM(nrib_pred) AS nrib_pred,
+			SUM(rib_pred) AS rib_pred,
+			SUM(cash_bal_pred ) AS cash_bal_pred,
+			SUM(bt_fee_pred ) AS bt_fee_pred,			
+			sum(total_bal_pred) as total_bal_pred,
+			sum(credit_line_pred) as credit_line_pred,
+			SUM(open_orig_pred ) AS open_orig_pred,
+			SUM(close_orig_pred ) AS close_orig_pred,
+			SUM(coff_orig_pred ) AS coff_orig_pred
+			
+			
+			from temppredpv
+			group by 1,2,3,4
+	;
+quit;
+
+
+/*data conspay.mc_predicted_curves_201802;*/
+/*set pred_pv_curves;*/
+/*run;*/

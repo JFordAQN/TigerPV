@@ -1,0 +1,151 @@
+%INCLUDE '~/parmfile.inc';
+
+
+/*LIBNAME SSSI ORACLE USER=&eid_ccrd.*/
+/*                PASSWORD=&pwd_ccrd.  */
+/*                PATH=F3RDPROD */
+/*                SCHEMA='OPS$F3RDPROD';*/
+
+libname RTLDISTR '/sasdata/nonrep/retail/distribution';
+libname CONSPAY '/sasdata/nonrep/conspay';
+
+/*
+This script takes the actual and predicted PV calculations (each dataset is account level by month) and 
+merges the account level data together. Then the script adds back in any account level data that you would 
+like to aggregate by. The last step is to complete the aggregation.
+
+The steps to update this script is;
+	*fill out the three universal variables with the dataset names for your driver table and the actual and predicted performance
+	* Update agg_pred_act_PV with any variables from the driver population you would like to include in aggregation
+	* Update pred_act_PV_w_addons so the new variables are included in the custom group bys
+*/
+
+%let acct_actuals = PV_w_TV_act; /*These stay the same*/
+%let acct_pred = PV_w_TV_pred; /*These stay the same*/
+%let acct_driver = Conspay.MC_DM_CUST_DEC_DRIVER;
+
+proc sql;
+	create table pred_act_PV as
+		select
+			a.acct_key,
+			a.mob ,
+			a.fico_scr_orig,
+			a.teaser_length ,		
+			a.channel ,
+			a.campaign_desc,
+			a.bau_flag,
+			a.credit_flag,
+			a.credit_line as amt_orig_crlim,					
+			b.clean_up_flag,
+			b.DQ60Ever as DQ60Ever_Act,
+			a.acct_key as acct_key,
+			a.pvol  AS pvol_pred,
+			a.close  AS close_pred,
+			a.coff as coff_pred,
+			a.nrib  AS nrib_pred,
+			a.rib  AS rib_pred,
+			a.cash_bal  AS cash_bal_pred,
+			a.bt_fee  AS bt_fee_pred,		
+			a.total_bal_orig as total_bal_pred,
+			a.credit_line as credit_line_pred,
+			a.open_orig  AS open_orig_pred,
+			a.close_orig  AS close_orig_pred,
+			a.coff_orig  AS coff_orig_pred,			
+			
+			b.pvol  AS pvol_act,
+			b.close  AS close_act,
+			b.coff as coff_act,
+			b.nrib  AS nrib_act,
+			b.rib  AS rib_act,
+			b.cash_bal  AS cash_bal_act,
+			b.bt_fee  AS bt_fee_act,			
+			b.total_bal_orig as total_bal_act,
+			b.credit_line as credit_line_act,
+			b.open_orig  AS open_orig_act,
+			b.close_orig  AS close_orig_act,
+			b.coff_orig  AS coff_orig_act,	
+	
+            c.campaign_desc AS campaign_desc,	      
+		    c.offer_type_0 as offer_type_0,
+			c.flag_2018			
+			
+
+
+		from (select * from &acct_pred.) a 
+		left join (select * from &acct_actuals.) b on a.acct_key = b.acct_key and a.mob = b.mob
+		          left join (select * from &acct_driver.) c on b.acct_key = c.acct_key
+	;          
+quit;
+
+
+proc sql;
+	create table agg_pred_act_PV as
+		select
+
+			case
+
+				when fico_scr_orig >= 600 and fico_scr_orig < 620 then 'FICO 600-619'	
+				when fico_scr_orig >= 620 and fico_scr_orig < 640 then 'FICO 620-639'
+				when fico_scr_orig >= 640 and fico_scr_orig < 660 then 'FICO 640-659'		
+				when fico_scr_orig >= 660 and fico_scr_orig < 680 then 'FICO 660-679'		
+				when fico_scr_orig >= 680 and fico_scr_orig < 700 then 'FICO 680-699'		
+				when fico_scr_orig >= 700 and fico_scr_orig < 720 then 'FICO 700-719'		
+				when fico_scr_orig >= 720 and fico_scr_orig < 750 then 'FICO 720-749'		
+				when fico_scr_orig >= 750 and fico_scr_orig < 800 then 'FICO 750-799'		
+				when fico_scr_orig >= 800 and fico_scr_orig <= 850 then 'FICO 800+'		
+				when fico_scr_orig < 600 then 'FICO <600'	
+				else 'Exclude'		
+			end 
+		as FICO_group,		    
+			mob,
+			channel,
+			clean_up_flag,            
+			offer_type_0,
+			bau_flag,
+			flag_2018,	
+			campaign_desc,			
+			count(acct_key) as num_accts,
+			count(distinct acct_key) as unique_accts,
+
+			SUM(pvol_pred) AS pvol_pred,
+			SUM(close_pred) AS close_pred,
+			SUM(coff_pred) AS coff_pred,
+			SUM(nrib_pred) AS nrib_pred,
+			SUM(rib_pred) AS rib_pred,
+			SUM(cash_bal_pred ) AS cash_bal_pred,
+			SUM(bt_fee_pred ) AS bt_fee_pred,			
+			sum(total_bal_pred) as total_bal_pred,
+			sum(credit_line_pred) as credit_line_pred,
+			SUM(open_orig_pred ) AS open_orig_pred,
+			SUM(close_orig_pred ) AS close_orig_pred,
+			SUM(coff_orig_pred ) AS coff_orig_pred,	
+
+			STD(pvol_act ) AS pvol_std,
+			STD(rib_act ) AS rib_std,
+			STD(nrib_act ) AS nrib_std,
+
+		    VAR(pvol_act ) AS pvol_var,
+			VAR(rib_act ) AS rib_var,
+			VAR(nrib_act ) AS nrib_var,
+	
+			
+			SUM(pvol_act ) AS pvol_act,		
+			SUM(close_act ) AS close_act,
+			SUM(coff_act) AS coff_act,
+			SUM(nrib_act ) AS nrib_act,
+			SUM(rib_act ) AS rib_act,
+			SUM(cash_bal_act ) AS cash_bal_act,
+			SUM(bt_fee_act ) AS bt_fee_act,			
+			sum(total_bal_act) as total_bal_act,
+			sum(credit_line_act) as credit_line_act,
+			SUM(open_orig_act ) AS open_orig_act,
+			SUM(close_orig_act ) AS close_orig_act,
+			SUM(coff_orig_act ) AS coff_orig_act,
+			SUM(DQ60Ever_Act) AS DQ60Ever_Act
+			
+			from pred_act_PV
+			group by 1,2,3,4,5,6,7,8
+	;
+quit;
+
+
