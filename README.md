@@ -2,4 +2,4 @@
 
 # Run PV Calc takes an input driver table for which we have pulled actual account performance data (using # Pull Perf) and assigns predicted driver curve values to each account in the driver table, based on their segmentation.
 
-# Agg Summary then creates an aggregated table, for use in exporting to excel to perform level adjustments. Those level adjustments are fed back to the tool to yield a adjusted predicted curves and final NPV valuation, which can be exported to excel for use in a waterfall view.
+# Agg Summary then creates an aggregated table, for use in exporting to excel to perform level adjustments. Those level adjustments are fed back to the tool to yield adjusted predicted curves and final NPV valuation, which can be exported to excel for use in a waterfall view.
